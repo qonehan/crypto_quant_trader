@@ -124,3 +124,36 @@ class Prediction(Base):
 
     def __repr__(self) -> str:
         return f"<Prediction {self.symbol} {self.t0} hat={self.direction_hat} ev={self.ev}>"
+
+
+class EvaluationResult(Base):
+    __tablename__ = "evaluation_results"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    ts = Column(DateTime(timezone=True), nullable=False)
+    symbol = Column(Text, nullable=False)
+    t0 = Column(DateTime(timezone=True), nullable=False)
+    r_t = Column(Double, nullable=False)
+    p_up = Column(Double, nullable=False)
+    p_down = Column(Double, nullable=False)
+    p_none = Column(Double, nullable=False)
+    ev = Column(Double, nullable=False)
+    slope_pred = Column(Double, nullable=False)
+    direction_hat = Column(Text, nullable=False)
+    actual_direction = Column(Text, nullable=False)
+    actual_r_t = Column(Double, nullable=False)
+    touch_time_sec = Column(Double, nullable=True)
+    status = Column(Text, nullable=False)
+    error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "t0", name="uq_evaluation_results_symbol_t0"),
+        Index("ix_evaluation_results_t0", "t0"),
+        Index("ix_evaluation_results_status", "status"),
+        Index("ix_evaluation_results_symbol_t0_desc", "symbol", t0.desc()),
+    )
+
+    def __repr__(self) -> str:
+        return f"<EvaluationResult {self.symbol} {self.t0} hat={self.direction_hat} actual={self.actual_direction}>"

@@ -203,5 +203,54 @@ def main() -> None:
         st.line_chart(pc["ev"])
 
 
+    # ── Evaluation Results ──────────────────────────────────────
+    st.subheader("Evaluation Results")
+
+    try:
+        with engine.connect() as conn:
+            eval_recent = pd.read_sql_query(
+                text(
+                    "SELECT t0, r_t, direction_hat, actual_direction, actual_r_t, "
+                    "touch_time_sec, ev, slope_pred, error, status "
+                    "FROM evaluation_results ORDER BY t0 DESC LIMIT 20"
+                ),
+                conn,
+            )
+            eval_stats = pd.read_sql_query(
+                text("""
+                    SELECT
+                        count(*) as total,
+                        sum(case when direction_hat = actual_direction then 1 else 0 end) as correct,
+                        sum(case when touch_time_sec is not null then 1 else 0 end) as hits,
+                        avg(cast(error as double precision)) as avg_error
+                    FROM evaluation_results
+                    WHERE status = 'COMPLETED'
+                """),
+                conn,
+            )
+    except Exception as e:
+        st.warning(f"evaluation_results table not available yet: {e}")
+        eval_recent = pd.DataFrame()
+        eval_stats = pd.DataFrame()
+
+    if eval_recent.empty:
+        st.info("No evaluation results yet. Evaluator starts after first horizon expires (H_SEC seconds).")
+    else:
+        if not eval_stats.empty and eval_stats.iloc[0]["total"] > 0:
+            es = eval_stats.iloc[0]
+            total = int(es["total"])
+            accuracy = int(es["correct"]) / total if total > 0 else 0
+            hit_rate = int(es["hits"]) / total if total > 0 else 0
+            avg_err = es["avg_error"] if pd.notna(es["avg_error"]) else 0
+
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            ec1.metric("Total Evaluated", total)
+            ec2.metric("Accuracy", f"{accuracy:.1%}")
+            ec3.metric("Hit Rate", f"{hit_rate:.1%}")
+            ec4.metric("Avg Error", f"{avg_err:.6f}")
+
+        st.dataframe(eval_recent, use_container_width=True, height=400)
+
+
 if __name__ == "__main__":
     main()

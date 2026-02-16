@@ -9,6 +9,7 @@ from app.barrier.controller import BarrierController
 from app.config import load_settings
 from app.db.init_db import ensure_schema
 from app.db.session import get_engine
+from app.evaluator.evaluator import Evaluator
 from app.marketdata.resampler import MarketResampler
 from app.marketdata.state import MarketState
 from app.marketdata.upbit_ws import UpbitWsClient
@@ -79,7 +80,7 @@ async def async_main() -> None:
     check_db(settings)
 
     ensure_schema(engine)
-    log.info("DB schema ensured (market_1s, barrier_state, predictions)")
+    log.info("DB schema ensured (market_1s, barrier_state, predictions, evaluation_results)")
 
     state = MarketState(symbol=settings.SYMBOL)
     queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
@@ -88,6 +89,7 @@ async def async_main() -> None:
     barrier = BarrierController(settings, engine)
     model = BaselineModel()
     pred_runner = PredictionRunner(settings, engine, model)
+    evaluator = Evaluator(settings, engine)
 
     async def sync_counters():
         while True:
@@ -103,6 +105,7 @@ async def async_main() -> None:
         asyncio.create_task(resampler.run(), name="resampler"),
         asyncio.create_task(barrier.run(), name="barrier"),
         asyncio.create_task(pred_runner.run(), name="predictor"),
+        asyncio.create_task(evaluator.run(), name="evaluator"),
     ]
 
     try:

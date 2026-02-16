@@ -100,3 +100,37 @@ ON CONFLICT ON CONSTRAINT uq_predictions_symbol_t0 DO UPDATE SET
 def upsert_prediction(engine: Engine, row: dict) -> None:
     with engine.begin() as conn:
         conn.execute(_UPSERT_PREDICTION_SQL, row)
+
+
+_UPSERT_EVAL_SQL = text("""
+INSERT INTO evaluation_results (
+    ts, symbol, t0, r_t,
+    p_up, p_down, p_none, ev, slope_pred,
+    direction_hat, actual_direction, actual_r_t, touch_time_sec,
+    status, error
+) VALUES (
+    :ts, :symbol, :t0, :r_t,
+    :p_up, :p_down, :p_none, :ev, :slope_pred,
+    :direction_hat, :actual_direction, :actual_r_t, :touch_time_sec,
+    :status, :error
+)
+ON CONFLICT ON CONSTRAINT uq_evaluation_results_symbol_t0 DO UPDATE SET
+    ts = EXCLUDED.ts,
+    r_t = EXCLUDED.r_t,
+    p_up = EXCLUDED.p_up,
+    p_down = EXCLUDED.p_down,
+    p_none = EXCLUDED.p_none,
+    ev = EXCLUDED.ev,
+    slope_pred = EXCLUDED.slope_pred,
+    direction_hat = EXCLUDED.direction_hat,
+    actual_direction = EXCLUDED.actual_direction,
+    actual_r_t = EXCLUDED.actual_r_t,
+    touch_time_sec = EXCLUDED.touch_time_sec,
+    status = EXCLUDED.status,
+    error = EXCLUDED.error
+""")
+
+
+def upsert_evaluation_result(engine: Engine, row: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_UPSERT_EVAL_SQL, row)
