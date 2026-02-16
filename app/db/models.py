@@ -7,8 +7,10 @@ from sqlalchemy import (
     Integer,
     PrimaryKeyConstraint,
     Text,
+    UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -82,3 +84,43 @@ class BarrierState(Base):
 
     def __repr__(self) -> str:
         return f"<BarrierState {self.symbol} {self.ts} r_t={self.r_t} status={self.status}>"
+
+
+class Prediction(Base):
+    __tablename__ = "predictions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    t0 = Column(DateTime(timezone=True), nullable=False)
+    symbol = Column(Text, nullable=False)
+    h_sec = Column(Integer, nullable=False)
+    r_t = Column(Double, nullable=False)
+
+    p_up = Column(Double, nullable=False)
+    p_down = Column(Double, nullable=False)
+    p_none = Column(Double, nullable=False)
+
+    t_up = Column(Double, nullable=True)
+    t_down = Column(Double, nullable=True)
+
+    slope_pred = Column(Double, nullable=False)
+    ev = Column(Double, nullable=False)
+    direction_hat = Column(Text, nullable=False)
+
+    model_version = Column(Text, nullable=False)
+    status = Column(Text, nullable=False)
+
+    sigma_1s = Column(Double, nullable=True)
+    sigma_h = Column(Double, nullable=True)
+    features = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "t0", name="uq_predictions_symbol_t0"),
+        Index("ix_predictions_status", "status"),
+        Index("ix_predictions_t0", "t0"),
+        Index("ix_predictions_symbol_t0_desc", "symbol", t0.desc()),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Prediction {self.symbol} {self.t0} hat={self.direction_hat} ev={self.ev}>"

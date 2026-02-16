@@ -62,3 +62,41 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
 def upsert_barrier_state(engine: Engine, row: dict) -> None:
     with engine.begin() as conn:
         conn.execute(_UPSERT_BARRIER_SQL, row)
+
+
+_UPSERT_PREDICTION_SQL = text("""
+INSERT INTO predictions (
+    t0, symbol, h_sec, r_t,
+    p_up, p_down, p_none, t_up, t_down,
+    slope_pred, ev, direction_hat,
+    model_version, status,
+    sigma_1s, sigma_h, features
+) VALUES (
+    :t0, :symbol, :h_sec, :r_t,
+    :p_up, :p_down, :p_none, :t_up, :t_down,
+    :slope_pred, :ev, :direction_hat,
+    :model_version, :status,
+    :sigma_1s, :sigma_h, :features
+)
+ON CONFLICT ON CONSTRAINT uq_predictions_symbol_t0 DO UPDATE SET
+    h_sec = EXCLUDED.h_sec,
+    r_t = EXCLUDED.r_t,
+    p_up = EXCLUDED.p_up,
+    p_down = EXCLUDED.p_down,
+    p_none = EXCLUDED.p_none,
+    t_up = EXCLUDED.t_up,
+    t_down = EXCLUDED.t_down,
+    slope_pred = EXCLUDED.slope_pred,
+    ev = EXCLUDED.ev,
+    direction_hat = EXCLUDED.direction_hat,
+    model_version = EXCLUDED.model_version,
+    status = EXCLUDED.status,
+    sigma_1s = EXCLUDED.sigma_1s,
+    sigma_h = EXCLUDED.sigma_h,
+    features = EXCLUDED.features
+""")
+
+
+def upsert_prediction(engine: Engine, row: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_UPSERT_PREDICTION_SQL, row)

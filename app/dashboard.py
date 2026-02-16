@@ -153,5 +153,55 @@ def main() -> None:
         st.dataframe(bs_recent, use_container_width=True, height=400)
 
 
+    # ── Predictions ──────────────────────────────────────
+    st.subheader("Predictions")
+
+    try:
+        with engine.connect() as conn:
+            pred_recent = pd.read_sql_query(
+                text(
+                    "SELECT t0, r_t, p_up, p_down, p_none, t_up, t_down, "
+                    "slope_pred, ev, direction_hat, status "
+                    "FROM predictions ORDER BY t0 DESC LIMIT 20"
+                ),
+                conn,
+            )
+            pred_chart = pd.read_sql_query(
+                text(
+                    "SELECT t0, slope_pred, ev "
+                    "FROM predictions ORDER BY t0 DESC LIMIT 360"
+                ),
+                conn,
+            )
+    except Exception as e:
+        st.warning(f"predictions table not available yet: {e}")
+        pred_recent = pd.DataFrame()
+        pred_chart = pd.DataFrame()
+
+    if pred_recent.empty:
+        st.info("No prediction rows yet. Wait for the first decision tick.")
+    else:
+        pr = pred_recent.iloc[0]
+        pred_ts = pd.to_datetime(pr["t0"], utc=True)
+        pred_lag = (now_utc - pred_ts).total_seconds()
+
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pc1.metric("direction_hat", pr["direction_hat"])
+        pc2.metric("EV", f"{pr['ev']:.8f}")
+        pc3.metric("slope_pred", f"{pr['slope_pred']:.8f}")
+        pc4.metric("Pred Lag (sec)", f"{pred_lag:.1f}")
+
+        st.dataframe(pred_recent, use_container_width=True, height=400)
+
+    if not pred_chart.empty:
+        pc = pred_chart.sort_values("t0").set_index("t0")
+
+        st.subheader("slope_pred — Last 30 min")
+        st.line_chart(pc["slope_pred"])
+
+        st.subheader("EV — Last 30 min")
+        st.line_chart(pc["ev"])
+
+
 if __name__ == "__main__":
     main()

@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     R_MAX: float = 0.03
     K_VOL: float = 1.0
 
+    MODEL_LOOKBACK_SEC: int = 120
+    FEE_RATE: float = 0.0005
+    SLIPPAGE_BPS: float = 2
+    EV_COST_MULT: float = 1.0
+    P_NONE_MAX_FOR_SIGNAL: float = 0.7
+
     MODE: str = "paper"
 
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
