@@ -33,3 +33,32 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
 def upsert_market_1s(engine: Engine, row: dict) -> None:
     with engine.begin() as conn:
         conn.execute(_UPSERT_SQL, row)
+
+
+_UPSERT_BARRIER_SQL = text("""
+INSERT INTO barrier_state (
+    ts, symbol, h_sec, vol_window_sec,
+    sigma_1s, sigma_h, r_min, k_vol, r_t,
+    sample_n, status, error
+) VALUES (
+    :ts, :symbol, :h_sec, :vol_window_sec,
+    :sigma_1s, :sigma_h, :r_min, :k_vol, :r_t,
+    :sample_n, :status, :error
+)
+ON CONFLICT (symbol, ts) DO UPDATE SET
+    h_sec = EXCLUDED.h_sec,
+    vol_window_sec = EXCLUDED.vol_window_sec,
+    sigma_1s = EXCLUDED.sigma_1s,
+    sigma_h = EXCLUDED.sigma_h,
+    r_min = EXCLUDED.r_min,
+    k_vol = EXCLUDED.k_vol,
+    r_t = EXCLUDED.r_t,
+    sample_n = EXCLUDED.sample_n,
+    status = EXCLUDED.status,
+    error = EXCLUDED.error
+""")
+
+
+def upsert_barrier_state(engine: Engine, row: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_UPSERT_BARRIER_SQL, row)

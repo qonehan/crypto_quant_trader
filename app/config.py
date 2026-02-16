@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     VOL_WINDOW_SEC: int = 600
 
     R_MIN: float = 0.0010
+    R_MAX: float = 0.03
     K_VOL: float = 1.0
 
     MODE: str = "paper"

@@ -81,6 +81,77 @@ def main() -> None:
         chart_df = chart_df.set_index("ts")
         st.line_chart(chart_df["mid"])
 
+    # ── Barrier State ──────────────────────────────────────
+    st.subheader("Barrier State")
+
+    try:
+        with engine.connect() as conn:
+            bs_latest = pd.read_sql_query(
+                text(
+                    "SELECT ts, symbol, r_t, sigma_1s, sigma_h, status, sample_n, "
+                    "h_sec, vol_window_sec, r_min, k_vol, error "
+                    "FROM barrier_state ORDER BY ts DESC LIMIT 1"
+                ),
+                conn,
+            )
+            bs_recent = pd.read_sql_query(
+                text(
+                    "SELECT ts, symbol, r_t, sigma_1s, sigma_h, status, sample_n "
+                    "FROM barrier_state ORDER BY ts DESC LIMIT 20"
+                ),
+                conn,
+            )
+            bs_chart = pd.read_sql_query(
+                text(
+                    "SELECT ts, r_t, sigma_h "
+                    "FROM barrier_state ORDER BY ts DESC LIMIT 360"
+                ),
+                conn,
+            )
+    except Exception as e:
+        st.warning(f"barrier_state table not available yet: {e}")
+        bs_latest = pd.DataFrame()
+        bs_recent = pd.DataFrame()
+        bs_chart = pd.DataFrame()
+
+    if bs_latest.empty:
+        st.info("No barrier_state rows yet. Wait for the first decision tick.")
+    else:
+        row = bs_latest.iloc[0]
+        barrier_ts = pd.to_datetime(row["ts"], utc=True)
+        barrier_lag = (now_utc - barrier_ts).total_seconds()
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("r_t", f"{row['r_t']:.6f}")
+        col2.metric("sigma_h", f"{row['sigma_h']:.8f}" if pd.notna(row["sigma_h"]) else "N/A")
+        col3.metric("Status", row["status"])
+        col4.metric("Barrier Lag (sec)", f"{barrier_lag:.1f}")
+
+        st.write(
+            f"**sample_n:** {row['sample_n']}  |  "
+            f"**h_sec:** {row['h_sec']}  |  "
+            f"**vol_window_sec:** {row['vol_window_sec']}  |  "
+            f"**sigma_1s:** {row['sigma_1s']:.8f}" if pd.notna(row.get("sigma_1s")) else
+            f"**sample_n:** {row['sample_n']}  |  "
+            f"**h_sec:** {row['h_sec']}  |  "
+            f"**vol_window_sec:** {row['vol_window_sec']}  |  "
+            f"**sigma_1s:** N/A"
+        )
+
+    if not bs_chart.empty:
+        st.subheader("r_t — Last 30 min")
+        c1 = bs_chart.sort_values("ts").set_index("ts")
+        st.line_chart(c1["r_t"])
+
+        st.subheader("sigma_h — Last 30 min")
+        c2 = c1.dropna(subset=["sigma_h"])
+        if not c2.empty:
+            st.line_chart(c2["sigma_h"])
+
+    if not bs_recent.empty:
+        st.subheader("barrier_state — Recent 20 rows")
+        st.dataframe(bs_recent, use_container_width=True, height=400)
+
 
 if __name__ == "__main__":
     main()

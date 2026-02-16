@@ -5,6 +5,7 @@ import logging
 
 from sqlalchemy import text
 
+from app.barrier.controller import BarrierController
 from app.config import load_settings
 from app.db.init_db import ensure_schema
 from app.db.session import get_engine
@@ -76,12 +77,13 @@ async def async_main() -> None:
     check_db(settings)
 
     ensure_schema(engine)
-    log.info("DB schema ensured (market_1s)")
+    log.info("DB schema ensured (market_1s, barrier_state)")
 
     state = MarketState(symbol=settings.SYMBOL)
     queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
     client = UpbitWsClient(settings, queue)
     resampler = MarketResampler(state, engine)
+    barrier = BarrierController(settings, engine)
 
     async def sync_counters():
         while True:
@@ -95,6 +97,7 @@ async def async_main() -> None:
         asyncio.create_task(printer(state), name="printer"),
         asyncio.create_task(sync_counters(), name="sync_counters"),
         asyncio.create_task(resampler.run(), name="resampler"),
+        asyncio.create_task(barrier.run(), name="barrier"),
     ]
 
     try:
