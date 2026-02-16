@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 from sqlalchemy import text
 
 from app.config import load_settings
+from app.db.init_db import ensure_schema
 from app.db.session import get_engine
+from app.marketdata.resampler import MarketResampler
 from app.marketdata.state import MarketState
 from app.marketdata.upbit_ws import UpbitWsClient
 
@@ -43,7 +44,11 @@ def check_db(settings) -> bool:
         return False
 
 
-async def consumer(queue: asyncio.Queue, state: MarketState) -> None:
+async def consumer(
+    queue: asyncio.Queue,
+    state: MarketState,
+    resampler: MarketResampler,
+) -> None:
     while True:
         event = await queue.get()
         etype = event["event_type"]
@@ -52,6 +57,8 @@ async def consumer(queue: asyncio.Queue, state: MarketState) -> None:
             state.update_ticker(payload)
         elif etype == "trade":
             state.update_trade(payload)
+            vol = payload.get("trade_volume", 0)
+            resampler.on_trade(vol)
         elif etype == "orderbook":
             state.update_orderbook(payload)
 
@@ -65,13 +72,17 @@ async def printer(state: MarketState) -> None:
 
 async def async_main() -> None:
     settings = load_settings()
+    engine = get_engine(settings)
     check_db(settings)
+
+    ensure_schema(engine)
+    log.info("DB schema ensured (market_1s)")
 
     state = MarketState(symbol=settings.SYMBOL)
     queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
     client = UpbitWsClient(settings, queue)
+    resampler = MarketResampler(state, engine)
 
-    # share counters between client and state
     async def sync_counters():
         while True:
             await asyncio.sleep(1)
@@ -80,9 +91,10 @@ async def async_main() -> None:
 
     tasks = [
         asyncio.create_task(client.run(), name="ws"),
-        asyncio.create_task(consumer(queue, state), name="consumer"),
+        asyncio.create_task(consumer(queue, state, resampler), name="consumer"),
         asyncio.create_task(printer(state), name="printer"),
         asyncio.create_task(sync_counters(), name="sync_counters"),
+        asyncio.create_task(resampler.run(), name="resampler"),
     ]
 
     try:

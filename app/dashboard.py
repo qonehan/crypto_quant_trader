@@ -1,4 +1,6 @@
 import streamlit as st
+import pandas as pd
+from datetime import datetime, timezone
 from sqlalchemy import text
 
 from app.config import load_settings
@@ -35,6 +37,49 @@ def main() -> None:
             st.warning(DB_RESOLVE_HINT)
         else:
             st.error(f"DB connection failed: {e}")
+        return
+
+    # ── market_1s data ──────────────────────────────────────
+    st.subheader("market_1s — Recent Data")
+
+    try:
+        with engine.connect() as conn:
+            # last 60 rows
+            df60 = pd.read_sql_query(
+                text(
+                    "SELECT ts, symbol, mid, bid, ask, spread, trade_count_1s, "
+                    "trade_volume_1s, imbalance_top5, last_trade_price, last_trade_side "
+                    "FROM market_1s ORDER BY ts DESC LIMIT 60"
+                ),
+                conn,
+            )
+            # last 300 rows for chart
+            df300 = pd.read_sql_query(
+                text("SELECT ts, mid FROM market_1s ORDER BY ts DESC LIMIT 300"),
+                conn,
+            )
+    except Exception as e:
+        st.warning(f"market_1s table not available yet: {e}")
+        return
+
+    if df60.empty:
+        st.info("No market_1s rows yet. Start the bot first.")
+        return
+
+    # lag
+    last_ts = pd.to_datetime(df60["ts"].iloc[0], utc=True)
+    now_utc = datetime.now(timezone.utc)
+    lag_sec = (now_utc - last_ts).total_seconds()
+    st.metric("Lag (sec)", f"{lag_sec:.1f}")
+
+    st.dataframe(df60, use_container_width=True, height=400)
+
+    # mid chart (5 min)
+    if not df300.empty:
+        st.subheader("Mid Price — Last 5 min")
+        chart_df = df300.sort_values("ts")
+        chart_df = chart_df.set_index("ts")
+        st.line_chart(chart_df["mid"])
 
 
 if __name__ == "__main__":
