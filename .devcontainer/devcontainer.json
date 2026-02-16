@@ -1,0 +1,22 @@
+{
+  "name": "btc-quant-bot",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "runServices": ["db"],
+  "forwardPorts": [8501],
+  "postCreateCommand": "poetry config virtualenvs.in-project true && (test -f .env || cp .env.example .env) && poetry install",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": ".venv/bin/python",
+        "python.analysis.typeCheckingMode": "basic"
+      },
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}
