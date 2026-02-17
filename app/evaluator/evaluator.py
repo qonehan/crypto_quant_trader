@@ -9,7 +9,11 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.config import Settings
-from app.db.writer import upsert_evaluation_result
+from app.db.writer import (
+    get_or_create_barrier_params,
+    update_barrier_params,
+    upsert_evaluation_result,
+)
 
 log = logging.getLogger(__name__)
 
@@ -204,15 +208,16 @@ class Evaluator:
             "logloss": logloss,
         }
 
-    def _run_batch(self, now_utc: datetime) -> int:
-        """Evaluate all eligible pending predictions. Returns count settled."""
+    def _run_batch(self, now_utc: datetime) -> tuple[int, list[dict]]:
+        """Evaluate all eligible pending predictions. Returns (count, settled_results)."""
         with self.engine.connect() as conn:
             pending = conn.execute(_FETCH_PENDING_SQL, {"now": now_utc}).fetchall()
 
         if not pending:
-            return 0
+            return 0, []
 
         settled = 0
+        settled_results: list[dict] = []
         for row in pending:
             pred = row._asdict()
             result = self._evaluate_one(pred, now_utc)
@@ -229,8 +234,48 @@ class Evaluator:
                 )
 
             settled += 1
+            settled_results.append(result)
 
-        return settled
+        return settled, settled_results
+
+    def _update_ewma_feedback(self, settled_results: list[dict]) -> None:
+        """Update EWMA none_rate feedback in barrier_params."""
+        if not settled_results:
+            return
+
+        symbol = self.settings.SYMBOL
+        alpha = self.settings.EWMA_ALPHA
+        eta = self.settings.EWMA_ETA
+
+        defaults = {
+            "k_vol_eff": self.settings.K_VOL,
+            "none_ewma": self.settings.TARGET_NONE,
+            "target_none": self.settings.TARGET_NONE,
+            "ewma_alpha": alpha,
+            "ewma_eta": eta,
+        }
+        params = get_or_create_barrier_params(self.engine, symbol, defaults)
+        none_ewma = params["none_ewma"]
+        k_vol_eff = params["k_vol_eff"]
+
+        # Process in t0 ascending order
+        sorted_results = sorted(settled_results, key=lambda r: r["t0"])
+        last_t0 = None
+        for res in sorted_results:
+            none_flag = 1.0 if res["actual_direction"] == "NONE" else 0.0
+            none_ewma = alpha * none_ewma + (1 - alpha) * none_flag
+            k_vol_eff = k_vol_eff * math.exp(-eta * (none_ewma - self.settings.TARGET_NONE))
+            k_vol_eff = max(self.settings.K_VOL_MIN, min(self.settings.K_VOL_MAX, k_vol_eff))
+            last_t0 = res["t0"]
+
+        update_barrier_params(self.engine, symbol, k_vol_eff, none_ewma, last_t0)
+
+        log.info(
+            "BarrierFeedback: n_new=%d none_ewma=%.4f k_vol_eff=%.4f "
+            "(target=%.2f alpha=%.2f eta=%.2f)",
+            len(sorted_results), none_ewma, k_vol_eff,
+            self.settings.TARGET_NONE, alpha, eta,
+        )
 
     def _compute_aggregate_metrics(self) -> dict | None:
         """Compute aggregate accuracy/hit_rate from recent exec_v1 evaluations."""
@@ -276,8 +321,9 @@ class Evaluator:
         while True:
             now_utc = datetime.now(timezone.utc).replace(microsecond=0)
             try:
-                settled = await asyncio.to_thread(self._run_batch, now_utc)
+                settled, settled_results = await asyncio.to_thread(self._run_batch, now_utc)
                 if settled > 0:
+                    await asyncio.to_thread(self._update_ewma_feedback, settled_results)
                     metrics = await asyncio.to_thread(self._compute_aggregate_metrics)
                     if metrics:
                         log.info(

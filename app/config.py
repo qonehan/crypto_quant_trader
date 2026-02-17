@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     R_MAX: float = 0.03
     K_VOL: float = 1.0
 
+    # EWMA feedback control
+    TARGET_NONE: float = 0.55
+    EWMA_ALPHA: float = 0.98
+    EWMA_ETA: float = 0.15
+    K_VOL_MIN: float = 0.50
+    K_VOL_MAX: float = 2.00
+    VOL_DT_SEC: int = 5
+
     MODEL_LOOKBACK_SEC: int = 120
     FEE_RATE: float = 0.0005
     SLIPPAGE_BPS: float = 2

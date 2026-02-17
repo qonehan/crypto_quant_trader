@@ -56,11 +56,13 @@ _UPSERT_BARRIER_SQL = text("""
 INSERT INTO barrier_state (
     ts, symbol, h_sec, vol_window_sec,
     sigma_1s, sigma_h, r_min, k_vol, r_t,
-    sample_n, status, error
+    sample_n, status, error,
+    k_vol_eff, none_ewma, target_none, ewma_alpha, ewma_eta, vol_dt_sec
 ) VALUES (
     :ts, :symbol, :h_sec, :vol_window_sec,
     :sigma_1s, :sigma_h, :r_min, :k_vol, :r_t,
-    :sample_n, :status, :error
+    :sample_n, :status, :error,
+    :k_vol_eff, :none_ewma, :target_none, :ewma_alpha, :ewma_eta, :vol_dt_sec
 )
 ON CONFLICT (symbol, ts) DO UPDATE SET
     h_sec = EXCLUDED.h_sec,
@@ -72,7 +74,13 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
     r_t = EXCLUDED.r_t,
     sample_n = EXCLUDED.sample_n,
     status = EXCLUDED.status,
-    error = EXCLUDED.error
+    error = EXCLUDED.error,
+    k_vol_eff = EXCLUDED.k_vol_eff,
+    none_ewma = EXCLUDED.none_ewma,
+    target_none = EXCLUDED.target_none,
+    ewma_alpha = EXCLUDED.ewma_alpha,
+    ewma_eta = EXCLUDED.ewma_eta,
+    vol_dt_sec = EXCLUDED.vol_dt_sec
 """)
 
 
@@ -163,3 +171,54 @@ ON CONFLICT ON CONSTRAINT uq_evaluation_results_symbol_t0 DO UPDATE SET
 def upsert_evaluation_result(engine: Engine, row: dict) -> None:
     with engine.begin() as conn:
         conn.execute(_UPSERT_EVAL_SQL, row)
+
+
+# ---------------------------------------------------------------------------
+# barrier_params CRUD
+# ---------------------------------------------------------------------------
+
+_SELECT_BARRIER_PARAMS = text("""
+SELECT symbol, k_vol_eff, none_ewma, target_none, ewma_alpha, ewma_eta,
+       last_eval_t0, updated_at
+FROM barrier_params WHERE symbol = :symbol
+""")
+
+_INSERT_BARRIER_PARAMS = text("""
+INSERT INTO barrier_params (symbol, k_vol_eff, none_ewma, target_none, ewma_alpha, ewma_eta)
+VALUES (:symbol, :k_vol_eff, :none_ewma, :target_none, :ewma_alpha, :ewma_eta)
+ON CONFLICT (symbol) DO NOTHING
+""")
+
+_UPDATE_BARRIER_PARAMS = text("""
+UPDATE barrier_params
+SET k_vol_eff = :k_vol_eff,
+    none_ewma = :none_ewma,
+    last_eval_t0 = :last_eval_t0,
+    updated_at = now()
+WHERE symbol = :symbol
+""")
+
+
+def get_or_create_barrier_params(engine: Engine, symbol: str, defaults: dict) -> dict:
+    with engine.begin() as conn:
+        row = conn.execute(_SELECT_BARRIER_PARAMS, {"symbol": symbol}).fetchone()
+        if row is not None:
+            return row._asdict()
+        conn.execute(_INSERT_BARRIER_PARAMS, {"symbol": symbol, **defaults})
+        row = conn.execute(_SELECT_BARRIER_PARAMS, {"symbol": symbol}).fetchone()
+        return row._asdict()
+
+
+def update_barrier_params(
+    engine: Engine, symbol: str, k_vol_eff: float, none_ewma: float, last_eval_t0
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            _UPDATE_BARRIER_PARAMS,
+            {
+                "symbol": symbol,
+                "k_vol_eff": k_vol_eff,
+                "none_ewma": none_ewma,
+                "last_eval_t0": last_eval_t0,
+            },
+        )
