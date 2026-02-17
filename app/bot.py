@@ -8,6 +8,7 @@ from sqlalchemy import text
 from app.barrier.controller import BarrierController
 from app.config import load_settings
 from app.db.init_db import ensure_schema
+from app.db.migrate import apply_migrations
 from app.db.session import get_engine
 from app.evaluator.evaluator import Evaluator
 from app.marketdata.resampler import MarketResampler
@@ -81,6 +82,9 @@ async def async_main() -> None:
 
     ensure_schema(engine)
     log.info("DB schema ensured (market_1s, barrier_state, predictions, evaluation_results)")
+
+    apply_migrations(engine)
+    log.info("DB migrations applied")
 
     state = MarketState(symbol=settings.SYMBOL)
     queue: asyncio.Queue = asyncio.Queue(maxsize=5000)

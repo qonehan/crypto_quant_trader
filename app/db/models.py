@@ -1,5 +1,6 @@
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     Double,
@@ -42,6 +43,19 @@ class Market1s(Base):
     trade_ts_ms = Column(BigInteger, nullable=True)
     orderbook_ts_ms = Column(BigInteger, nullable=True)
 
+    # v1: bid/ask OHLC
+    bid_open_1s = Column(Double, nullable=True)
+    bid_high_1s = Column(Double, nullable=True)
+    bid_low_1s = Column(Double, nullable=True)
+    bid_close_1s = Column(Double, nullable=True)
+    ask_open_1s = Column(Double, nullable=True)
+    ask_high_1s = Column(Double, nullable=True)
+    ask_low_1s = Column(Double, nullable=True)
+    ask_close_1s = Column(Double, nullable=True)
+    spread_bps = Column(Double, nullable=True)
+    imb_notional_top5 = Column(Double, nullable=True)
+    mid_close_1s = Column(Double, nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
@@ -73,6 +87,14 @@ class BarrierState(Base):
     sample_n = Column(Integer, nullable=False, default=0)
     status = Column(Text, nullable=False)
     error = Column(Text, nullable=True)
+
+    # v1: feedback / state tracking
+    k_vol_eff = Column(Double, nullable=True)
+    none_ewma = Column(Double, nullable=True)
+    target_none = Column(Double, nullable=True)
+    ewma_alpha = Column(Double, nullable=True)
+    ewma_eta = Column(Double, nullable=True)
+    vol_dt_sec = Column(Integer, nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
@@ -113,6 +135,18 @@ class Prediction(Base):
     sigma_h = Column(Double, nullable=True)
     features = Column(JSONB, nullable=True)
 
+    # v1: probability / EV fields
+    z_barrier = Column(Double, nullable=True)
+    p_hit_base = Column(Double, nullable=True)
+    ev_rate = Column(Double, nullable=True)
+    r_none_pred = Column(Double, nullable=True)
+    t_up_cond_pred = Column(Double, nullable=True)
+    t_down_cond_pred = Column(Double, nullable=True)
+    spread_bps = Column(Double, nullable=True)
+    mom_z = Column(Double, nullable=True)
+    imb_notional_top5 = Column(Double, nullable=True)
+    action_hat = Column(Text, nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
@@ -146,6 +180,16 @@ class EvaluationResult(Base):
     status = Column(Text, nullable=False)
     error = Column(Text, nullable=True)
 
+    # v1: exec_v1 label / probability assessment
+    label_version = Column(Text, nullable=True)
+    entry_price = Column(Double, nullable=True)
+    u_exec = Column(Double, nullable=True)
+    d_exec = Column(Double, nullable=True)
+    ambig_touch = Column(Boolean, nullable=True)
+    r_h = Column(Double, nullable=True)
+    brier = Column(Double, nullable=True)
+    logloss = Column(Double, nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
@@ -157,3 +201,19 @@ class EvaluationResult(Base):
 
     def __repr__(self) -> str:
         return f"<EvaluationResult {self.symbol} {self.t0} hat={self.direction_hat} actual={self.actual_direction}>"
+
+
+class BarrierParams(Base):
+    __tablename__ = "barrier_params"
+
+    symbol = Column(Text, primary_key=True)
+    k_vol_eff = Column(Double, nullable=False)
+    none_ewma = Column(Double, nullable=False)
+    target_none = Column(Double, nullable=False)
+    ewma_alpha = Column(Double, nullable=False)
+    ewma_eta = Column(Double, nullable=False)
+    last_eval_t0 = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<BarrierParams {self.symbol} k_vol_eff={self.k_vol_eff}>"
