@@ -6,12 +6,18 @@ INSERT INTO market_1s (
     ts, symbol, mid, bid, ask, spread,
     trade_count_1s, trade_volume_1s, imbalance_top5,
     last_trade_price, last_trade_volume, last_trade_side,
-    ticker_ts_ms, trade_ts_ms, orderbook_ts_ms
+    ticker_ts_ms, trade_ts_ms, orderbook_ts_ms,
+    bid_open_1s, bid_high_1s, bid_low_1s, bid_close_1s,
+    ask_open_1s, ask_high_1s, ask_low_1s, ask_close_1s,
+    spread_bps, imb_notional_top5, mid_close_1s
 ) VALUES (
     :ts, :symbol, :mid, :bid, :ask, :spread,
     :trade_count_1s, :trade_volume_1s, :imbalance_top5,
     :last_trade_price, :last_trade_volume, :last_trade_side,
-    :ticker_ts_ms, :trade_ts_ms, :orderbook_ts_ms
+    :ticker_ts_ms, :trade_ts_ms, :orderbook_ts_ms,
+    :bid_open_1s, :bid_high_1s, :bid_low_1s, :bid_close_1s,
+    :ask_open_1s, :ask_high_1s, :ask_low_1s, :ask_close_1s,
+    :spread_bps, :imb_notional_top5, :mid_close_1s
 )
 ON CONFLICT (symbol, ts) DO UPDATE SET
     mid = EXCLUDED.mid,
@@ -26,7 +32,18 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
     last_trade_side = EXCLUDED.last_trade_side,
     ticker_ts_ms = EXCLUDED.ticker_ts_ms,
     trade_ts_ms = EXCLUDED.trade_ts_ms,
-    orderbook_ts_ms = EXCLUDED.orderbook_ts_ms
+    orderbook_ts_ms = EXCLUDED.orderbook_ts_ms,
+    bid_open_1s = EXCLUDED.bid_open_1s,
+    bid_high_1s = EXCLUDED.bid_high_1s,
+    bid_low_1s = EXCLUDED.bid_low_1s,
+    bid_close_1s = EXCLUDED.bid_close_1s,
+    ask_open_1s = EXCLUDED.ask_open_1s,
+    ask_high_1s = EXCLUDED.ask_high_1s,
+    ask_low_1s = EXCLUDED.ask_low_1s,
+    ask_close_1s = EXCLUDED.ask_close_1s,
+    spread_bps = EXCLUDED.spread_bps,
+    imb_notional_top5 = EXCLUDED.imb_notional_top5,
+    mid_close_1s = EXCLUDED.mid_close_1s
 """)
 
 

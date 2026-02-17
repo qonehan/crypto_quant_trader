@@ -66,6 +66,25 @@ async def consumer(
             resampler.on_trade(vol)
         elif etype == "orderbook":
             state.update_orderbook(payload)
+            # Feed bid/ask OHLC + notional imbalance to resampler
+            units = payload.get("orderbook_units", [])
+            if units:
+                best_bid = units[0].get("bid_price")
+                best_ask = units[0].get("ask_price")
+                if best_bid and best_ask:
+                    eps = 1e-12
+                    b_notional = sum(
+                        u.get("bid_price", 0) * u.get("bid_size", 0) for u in units
+                    )
+                    a_notional = sum(
+                        u.get("ask_price", 0) * u.get("ask_size", 0) for u in units
+                    )
+                    imb_notional = (b_notional - a_notional) / (b_notional + a_notional + eps)
+                    resampler.on_quote(
+                        bid=best_bid,
+                        ask=best_ask,
+                        imb_notional_top5=imb_notional,
+                    )
 
 
 async def printer(state: MarketState) -> None:
