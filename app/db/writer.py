@@ -124,12 +124,16 @@ INSERT INTO evaluation_results (
     ts, symbol, t0, r_t,
     p_up, p_down, p_none, ev, slope_pred,
     direction_hat, actual_direction, actual_r_t, touch_time_sec,
-    status, error
+    status, error,
+    label_version, entry_price, u_exec, d_exec, ambig_touch, r_h,
+    brier, logloss
 ) VALUES (
     :ts, :symbol, :t0, :r_t,
     :p_up, :p_down, :p_none, :ev, :slope_pred,
     :direction_hat, :actual_direction, :actual_r_t, :touch_time_sec,
-    :status, :error
+    :status, :error,
+    :label_version, :entry_price, :u_exec, :d_exec, :ambig_touch, :r_h,
+    :brier, :logloss
 )
 ON CONFLICT ON CONSTRAINT uq_evaluation_results_symbol_t0 DO UPDATE SET
     ts = EXCLUDED.ts,
@@ -144,7 +148,15 @@ ON CONFLICT ON CONSTRAINT uq_evaluation_results_symbol_t0 DO UPDATE SET
     actual_r_t = EXCLUDED.actual_r_t,
     touch_time_sec = EXCLUDED.touch_time_sec,
     status = EXCLUDED.status,
-    error = EXCLUDED.error
+    error = EXCLUDED.error,
+    label_version = EXCLUDED.label_version,
+    entry_price = EXCLUDED.entry_price,
+    u_exec = EXCLUDED.u_exec,
+    d_exec = EXCLUDED.d_exec,
+    ambig_touch = EXCLUDED.ambig_touch,
+    r_h = EXCLUDED.r_h,
+    brier = EXCLUDED.brier,
+    logloss = EXCLUDED.logloss
 """)
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import time
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
@@ -13,6 +12,8 @@ from app.config import Settings
 from app.db.writer import upsert_evaluation_result
 
 log = logging.getLogger(__name__)
+
+_EPS = 1e-12
 
 # Fetch PENDING predictions whose horizon has expired (t0 + h_sec <= now)
 _FETCH_PENDING_SQL = text("""
@@ -25,14 +26,32 @@ ORDER BY t0 ASC
 LIMIT 50
 """)
 
-# Fetch market_1s mid prices in the horizon window [t0, t0+h_sec]
-_FETCH_HORIZON_MIDS_SQL = text("""
-SELECT ts, mid
+# Entry row: most recent bar-end <= t0
+_FETCH_ENTRY_ROW_SQL = text("""
+SELECT ts, bid_close_1s, ask_close_1s, bid, ask
+FROM market_1s
+WHERE symbol = :symbol AND ts <= :t0
+ORDER BY ts DESC
+LIMIT 1
+""")
+
+# Horizon rows for touch detection: ts > t0 AND ts <= t0+H (bar-end semantics)
+_FETCH_HORIZON_ROWS_SQL = text("""
+SELECT ts, bid_high_1s, bid_low_1s, bid_close_1s, bid
 FROM market_1s
 WHERE symbol = :symbol
-  AND ts >= :t0
-  AND ts <= :t0_end
+  AND ts > :t0
+  AND ts <= :t_end
 ORDER BY ts ASC
+""")
+
+# Horizon-end row for r_h (NONE exit price)
+_FETCH_HORIZON_END_SQL = text("""
+SELECT ts, bid_close_1s, bid
+FROM market_1s
+WHERE symbol = :symbol AND ts <= :t_end
+ORDER BY ts DESC
+LIMIT 1
 """)
 
 # Mark prediction as SETTLED
@@ -45,79 +64,127 @@ class Evaluator:
     def __init__(self, settings: Settings, engine: Engine) -> None:
         self.settings = settings
         self.engine = engine
+        self._slip_rate = settings.SLIPPAGE_BPS / 10000.0
 
     def _evaluate_one(self, pred: dict, now_utc: datetime) -> dict | None:
-        """Evaluate a single prediction against actual market data."""
+        """Evaluate a single prediction using exec_v1 label logic."""
         symbol = pred["symbol"]
         t0 = pred["t0"]
         h_sec = pred["h_sec"]
         r_t = pred["r_t"]
+        t_end = t0 + timedelta(seconds=h_sec)
 
-        t0_end = t0 + timedelta(seconds=h_sec)
-
-        # Fetch mid prices in the horizon window
+        # (1) Entry row
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                _FETCH_HORIZON_MIDS_SQL,
-                {"symbol": symbol, "t0": t0, "t0_end": t0_end},
-            ).fetchall()
+            row0 = conn.execute(
+                _FETCH_ENTRY_ROW_SQL, {"symbol": symbol, "t0": t0}
+            ).fetchone()
 
-        if len(rows) < 2:
-            return None  # not enough data yet
-
-        mid_t0 = rows[0].mid
-        if mid_t0 is None or mid_t0 <= 0:
+        if row0 is None:
+            log.warning("exec_v1: no entry row for t0=%s, skipping", t0)
             return None
 
-        up_barrier = mid_t0 * (1.0 + r_t)
-        down_barrier = mid_t0 * (1.0 - r_t)
+        # Skip if entry row too stale (>5s before t0)
+        if (t0 - row0.ts).total_seconds() > 5.0:
+            log.warning("exec_v1: entry row ts=%s too far from t0=%s, skipping", row0.ts, t0)
+            return None
+
+        # (2) Entry price (ask + slippage)
+        ask0 = row0.ask_close_1s if row0.ask_close_1s is not None else row0.ask
+        if ask0 is None or ask0 <= 0:
+            log.warning("exec_v1: no valid ask for t0=%s, skipping", t0)
+            return None
+        entry_price = ask0 * (1 + self._slip_rate)
+
+        # (3) Barriers
+        u_exec = entry_price * (1 + r_t)
+        d_exec = entry_price * (1 - r_t)
+
+        # (4) Touch detection (ts > t0, ts <= t_end)
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                _FETCH_HORIZON_ROWS_SQL,
+                {"symbol": symbol, "t0": t0, "t_end": t_end},
+            ).fetchall()
+
+        if not rows:
+            log.warning("exec_v1: no horizon rows for t0=%s, skipping", t0)
+            return None
 
         actual_direction = "NONE"
-        actual_r_t = 0.0
         touch_time_sec = None
+        ambig_touch = False
+        actual_r_t = 0.0
 
-        for row in rows[1:]:
-            if row.mid is None or row.mid <= 0:
+        for row in rows:
+            bh = row.bid_high_1s
+            bl = row.bid_low_1s
+            if bh is None or bl is None:
                 continue
-            elapsed = (row.ts - t0).total_seconds()
 
-            if row.mid >= up_barrier:
-                actual_direction = "UP"
-                actual_r_t = (row.mid - mid_t0) / mid_t0
-                touch_time_sec = elapsed
-                break
-            elif row.mid <= down_barrier:
+            exec_bid_high = bh * (1 - self._slip_rate)
+            exec_bid_low = bl * (1 - self._slip_rate)
+
+            up_hit = exec_bid_high >= u_exec
+            dn_hit = exec_bid_low <= d_exec
+
+            if up_hit and dn_hit:
+                # Ambiguous: both barriers touched in same 1s bar → DOWN priority
+                ambig_touch = True
                 actual_direction = "DOWN"
-                actual_r_t = (mid_t0 - row.mid) / mid_t0
-                touch_time_sec = elapsed
+                actual_r_t = r_t
+                touch_time_sec = max(0.0, (row.ts - t0).total_seconds() - 0.5)
+                break
+            elif dn_hit:
+                actual_direction = "DOWN"
+                actual_r_t = r_t
+                touch_time_sec = max(0.0, (row.ts - t0).total_seconds() - 0.5)
+                break
+            elif up_hit:
+                actual_direction = "UP"
+                actual_r_t = r_t
+                touch_time_sec = max(0.0, (row.ts - t0).total_seconds() - 0.5)
                 break
 
-        # If no barrier touched, compute final return
+        # (6) NONE: compute r_h
+        r_h = None
         if actual_direction == "NONE":
-            last_mid = None
-            for row in reversed(rows):
-                if row.mid is not None and row.mid > 0:
-                    last_mid = row.mid
-                    break
-            if last_mid is not None:
-                actual_r_t = abs(last_mid - mid_t0) / mid_t0
+            with self.engine.connect() as conn:
+                rowH = conn.execute(
+                    _FETCH_HORIZON_END_SQL, {"symbol": symbol, "t_end": t_end}
+                ).fetchone()
+            if rowH is not None:
+                exit_bid = rowH.bid_close_1s if rowH.bid_close_1s is not None else rowH.bid
+                if exit_bid is not None and exit_bid > 0:
+                    exit_exec = exit_bid * (1 - self._slip_rate)
+                    r_h = (exit_exec - entry_price) / entry_price
+                    actual_r_t = abs(r_h)
 
-        # Compute error: predicted direction probability minus actual outcome
+        # (8) Brier score & logloss
+        p_up = pred["p_up"]
+        p_down = pred["p_down"]
+        p_none = pred["p_none"]
+
         if actual_direction == "UP":
-            error_val = pred["p_up"] - 1.0
+            y = (1, 0, 0)
         elif actual_direction == "DOWN":
-            error_val = pred["p_down"] - 1.0
+            y = (0, 1, 0)
         else:
-            error_val = pred["p_none"] - 1.0
+            y = (0, 0, 1)
+
+        brier = (p_up - y[0]) ** 2 + (p_down - y[1]) ** 2 + (p_none - y[2]) ** 2
+
+        p_actual = (p_up, p_down, p_none)[("UP", "DOWN", "NONE").index(actual_direction)]
+        logloss = -math.log(max(p_actual, _EPS))
 
         return {
             "ts": now_utc,
             "symbol": symbol,
             "t0": t0,
             "r_t": r_t,
-            "p_up": pred["p_up"],
-            "p_down": pred["p_down"],
-            "p_none": pred["p_none"],
+            "p_up": p_up,
+            "p_down": p_down,
+            "p_none": p_none,
             "ev": pred["ev"],
             "slope_pred": pred["slope_pred"],
             "direction_hat": pred["direction_hat"],
@@ -125,7 +192,16 @@ class Evaluator:
             "actual_r_t": actual_r_t,
             "touch_time_sec": touch_time_sec,
             "status": "COMPLETED",
-            "error": f"{error_val:.6f}",
+            "error": None,
+            # exec_v1 fields
+            "label_version": "exec_v1",
+            "entry_price": entry_price,
+            "u_exec": u_exec,
+            "d_exec": d_exec,
+            "ambig_touch": ambig_touch,
+            "r_h": r_h,
+            "brier": brier,
+            "logloss": logloss,
         }
 
     def _run_batch(self, now_utc: datetime) -> int:
@@ -157,12 +233,14 @@ class Evaluator:
         return settled
 
     def _compute_aggregate_metrics(self) -> dict | None:
-        """Compute aggregate accuracy/hit_rate from recent evaluations."""
+        """Compute aggregate accuracy/hit_rate from recent exec_v1 evaluations."""
         with self.engine.connect() as conn:
             rows = conn.execute(
                 text("""
-                    SELECT direction_hat, actual_direction, touch_time_sec, error
+                    SELECT direction_hat, actual_direction, touch_time_sec,
+                           brier, logloss, ambig_touch
                     FROM evaluation_results
+                    WHERE label_version = 'exec_v1'
                     ORDER BY t0 DESC LIMIT 100
                 """)
             ).fetchall()
@@ -173,14 +251,19 @@ class Evaluator:
         total = len(rows)
         correct = sum(1 for r in rows if r.direction_hat == r.actual_direction)
         hits = sum(1 for r in rows if r.touch_time_sec is not None)
-        errors = [float(r.error) for r in rows if r.error is not None]
-        avg_error = sum(errors) / len(errors) if errors else 0.0
+        ambig = sum(1 for r in rows if r.ambig_touch is True)
+        briers = [r.brier for r in rows if r.brier is not None]
+        loglosses = [r.logloss for r in rows if r.logloss is not None]
+        avg_brier = sum(briers) / len(briers) if briers else 0.0
+        avg_logloss = sum(loglosses) / len(loglosses) if loglosses else 0.0
 
         return {
             "total": total,
             "accuracy": correct / total,
             "hit_rate": hits / total,
-            "avg_error": avg_error,
+            "ambig_count": ambig,
+            "avg_brier": avg_brier,
+            "avg_logloss": avg_logloss,
         }
 
     async def run(self) -> None:
@@ -198,15 +281,18 @@ class Evaluator:
                     metrics = await asyncio.to_thread(self._compute_aggregate_metrics)
                     if metrics:
                         log.info(
-                            "Eval: settled=%d total=%d accuracy=%.3f hit_rate=%.3f avg_error=%.6f",
+                            "Eval(exec_v1): settled=%d total=%d acc=%.3f hit=%.3f "
+                            "ambig=%d brier=%.4f logloss=%.4f",
                             settled,
                             metrics["total"],
                             metrics["accuracy"],
                             metrics["hit_rate"],
-                            metrics["avg_error"],
+                            metrics["ambig_count"],
+                            metrics["avg_brier"],
+                            metrics["avg_logloss"],
                         )
                     else:
-                        log.info("Eval: settled=%d predictions", settled)
+                        log.info("Eval(exec_v1): settled=%d predictions", settled)
             except Exception:
                 log.exception("Evaluator error")
 
