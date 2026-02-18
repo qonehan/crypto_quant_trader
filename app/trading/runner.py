@@ -17,6 +17,8 @@ from app.db.writer import (
 )
 from app.marketdata.state import MarketState
 from app.trading.paper import execute_enter_long, execute_exit_long
+import json
+
 from app.trading.policy import decide_action, _compute_cost_est
 
 log = logging.getLogger(__name__)
@@ -78,10 +80,14 @@ class PaperTradingRunner:
         pred = self._fetch_latest_pred()
         snapshot = self._get_market_snapshot(now_utc)
 
-        action, reason = decide_action(now_utc, pos, pred, snapshot, self.settings)
+        action, reason, reason_flags, diag = decide_action(
+            now_utc, pos, pred, snapshot, self.settings
+        )
 
         # Build cost estimate for decision log
-        cost_est = _compute_cost_est(snapshot.get("spread_bps", 0), self.settings)
+        cost_est = diag.get("cost_est") or _compute_cost_est(
+            snapshot.get("spread_bps", 0), self.settings
+        )
 
         decision = {
             "ts": now_utc,
@@ -101,6 +107,7 @@ class PaperTradingRunner:
             "cost_roundtrip_est": cost_est,
             "model_version": pred.get("model_version") if pred else None,
             "pred_t0": pred.get("t0") if pred else None,
+            "reason_flags": json.dumps(reason_flags),
         }
         insert_paper_decision(self.engine, decision)
 

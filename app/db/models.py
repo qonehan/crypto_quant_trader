@@ -96,6 +96,11 @@ class BarrierState(Base):
     ewma_eta = Column(Double, nullable=True)
     vol_dt_sec = Column(Integer, nullable=True)
 
+    # v1.1: cost-based r_t floor
+    spread_bps_med = Column(Double, nullable=True)
+    cost_roundtrip_est = Column(Double, nullable=True)
+    r_min_eff = Column(Double, nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
@@ -292,6 +297,7 @@ class PaperDecision(Base):
     cost_roundtrip_est = Column(Double, nullable=True)
     model_version = Column(Text, nullable=True)
     pred_t0 = Column(DateTime(timezone=True), nullable=True)
+    reason_flags = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (

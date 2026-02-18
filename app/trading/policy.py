@@ -9,13 +9,30 @@ def decide_action(
     pred_row: dict | None,
     market_snapshot: dict,
     settings,
-) -> tuple[str, str]:
-    """Return (action, reason) based on current position and prediction."""
+) -> tuple[str, str, list[str], dict]:
+    """Return (action, primary_reason, reason_flags, diag) based on current position and prediction.
+
+    reason_flags collects ALL failing conditions (not just the first).
+    primary_reason is chosen by priority order.
+    """
     pos_status = pos_row["status"]
 
     if pos_status == "LONG":
-        return _decide_long(now_utc, pos_row, pred_row, market_snapshot, settings)
+        action, reason = _decide_long(now_utc, pos_row, pred_row, market_snapshot, settings)
+        return action, reason, [reason], {}
     return _decide_flat(now_utc, pred_row, market_snapshot, settings)
+
+
+# Priority order for FLAT → ENTER checks (higher index = lower priority)
+_FLAT_PRIORITY = [
+    "DATA_LAG",
+    "SPREAD_WIDE",
+    "NO_PRED",
+    "COST_GT_RT",
+    "PNONE_HIGH",
+    "PDIR_WEAK",
+    "EV_RATE_LOW",
+]
 
 
 def _decide_flat(
@@ -23,40 +40,59 @@ def _decide_flat(
     pred_row: dict | None,
     market_snapshot: dict,
     settings,
-) -> tuple[str, str]:
+) -> tuple[str, str, list[str], dict]:
+    flags: list[str] = []
+    diag: dict = {}
+
     lag_sec = market_snapshot.get("lag_sec", 999)
     spread_bps = market_snapshot.get("spread_bps", 999)
 
     # Data / market safety
     if lag_sec > settings.DATA_LAG_SEC_MAX:
-        return "STAY_FLAT", "DATA_LAG"
+        flags.append("DATA_LAG")
     if spread_bps > settings.ENTER_SPREAD_BPS_MAX:
-        return "STAY_FLAT", "SPREAD_WIDE"
+        flags.append("SPREAD_WIDE")
 
-    # Signal filters
     if pred_row is None:
-        return "STAY_FLAT", "NO_PRED"
+        flags.append("NO_PRED")
+        primary = _pick_primary(flags)
+        return "STAY_FLAT", primary, flags, diag
 
     ev_rate = pred_row.get("ev_rate")
-    if ev_rate is None or ev_rate < settings.ENTER_EV_RATE_TH:
-        return "STAY_FLAT", "EV_RATE_LOW"
-
     p_none = pred_row.get("p_none", 1.0)
-    if p_none > settings.ENTER_PNONE_MAX:
-        return "STAY_FLAT", "PNONE_HIGH"
-
     p_up = pred_row.get("p_up", 0)
     p_down = pred_row.get("p_down", 0)
-    if p_up < p_down + settings.ENTER_PDIR_MARGIN:
-        return "STAY_FLAT", "PDIR_WEAK"
+    r_t = pred_row.get("r_t", 0)
+
+    cost_est = _compute_cost_est(spread_bps, settings)
+    diag["cost_est"] = cost_est
 
     # Cost vs r_t
-    r_t = pred_row.get("r_t", 0)
-    cost_est = _compute_cost_est(spread_bps, settings)
     if r_t <= settings.COST_RMIN_MULT * cost_est:
-        return "STAY_FLAT", "COST_GT_RT"
+        flags.append("COST_GT_RT")
 
-    return "ENTER_LONG", "OK"
+    if p_none > settings.ENTER_PNONE_MAX:
+        flags.append("PNONE_HIGH")
+
+    if p_up < p_down + settings.ENTER_PDIR_MARGIN:
+        flags.append("PDIR_WEAK")
+
+    if ev_rate is None or ev_rate < settings.ENTER_EV_RATE_TH:
+        flags.append("EV_RATE_LOW")
+
+    if flags:
+        primary = _pick_primary(flags)
+        return "STAY_FLAT", primary, flags, diag
+
+    return "ENTER_LONG", "OK", ["OK"], diag
+
+
+def _pick_primary(flags: list[str]) -> str:
+    """Pick primary reason by priority order."""
+    for reason in _FLAT_PRIORITY:
+        if reason in flags:
+            return reason
+    return flags[0] if flags else "OK"
 
 
 def _decide_long(

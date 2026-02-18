@@ -57,12 +57,14 @@ INSERT INTO barrier_state (
     ts, symbol, h_sec, vol_window_sec,
     sigma_1s, sigma_h, r_min, k_vol, r_t,
     sample_n, status, error,
-    k_vol_eff, none_ewma, target_none, ewma_alpha, ewma_eta, vol_dt_sec
+    k_vol_eff, none_ewma, target_none, ewma_alpha, ewma_eta, vol_dt_sec,
+    spread_bps_med, cost_roundtrip_est, r_min_eff
 ) VALUES (
     :ts, :symbol, :h_sec, :vol_window_sec,
     :sigma_1s, :sigma_h, :r_min, :k_vol, :r_t,
     :sample_n, :status, :error,
-    :k_vol_eff, :none_ewma, :target_none, :ewma_alpha, :ewma_eta, :vol_dt_sec
+    :k_vol_eff, :none_ewma, :target_none, :ewma_alpha, :ewma_eta, :vol_dt_sec,
+    :spread_bps_med, :cost_roundtrip_est, :r_min_eff
 )
 ON CONFLICT (symbol, ts) DO UPDATE SET
     h_sec = EXCLUDED.h_sec,
@@ -80,7 +82,10 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
     target_none = EXCLUDED.target_none,
     ewma_alpha = EXCLUDED.ewma_alpha,
     ewma_eta = EXCLUDED.ewma_eta,
-    vol_dt_sec = EXCLUDED.vol_dt_sec
+    vol_dt_sec = EXCLUDED.vol_dt_sec,
+    spread_bps_med = EXCLUDED.spread_bps_med,
+    cost_roundtrip_est = EXCLUDED.cost_roundtrip_est,
+    r_min_eff = EXCLUDED.r_min_eff
 """)
 
 
@@ -279,10 +284,12 @@ VALUES (:t, :symbol, :action, :reason, :price, :qty, :fee_krw, :cash_after,
 _INSERT_PAPER_DECISION = text("""
 INSERT INTO paper_decisions (ts, symbol, pos_status, action, reason,
                              ev_rate, ev, p_up, p_down, p_none, r_t, z_barrier,
-                             spread_bps, lag_sec, cost_roundtrip_est, model_version, pred_t0)
+                             spread_bps, lag_sec, cost_roundtrip_est, model_version, pred_t0,
+                             reason_flags)
 VALUES (:ts, :symbol, :pos_status, :action, :reason,
         :ev_rate, :ev, :p_up, :p_down, :p_none, :r_t, :z_barrier,
-        :spread_bps, :lag_sec, :cost_roundtrip_est, :model_version, :pred_t0)
+        :spread_bps, :lag_sec, :cost_roundtrip_est, :model_version, :pred_t0,
+        :reason_flags)
 """)
 
 

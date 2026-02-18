@@ -1,3 +1,5 @@
+import json
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
@@ -94,7 +96,8 @@ def main() -> None:
             bs_latest = pd.read_sql_query(
                 text(
                     "SELECT ts, symbol, r_t, sigma_1s, sigma_h, status, sample_n, "
-                    "h_sec, vol_window_sec, r_min, k_vol, k_vol_eff, none_ewma "
+                    "h_sec, vol_window_sec, r_min, k_vol, k_vol_eff, none_ewma, "
+                    "r_min_eff, cost_roundtrip_est, spread_bps_med "
                     "FROM barrier_state WHERE symbol = :sym ORDER BY ts DESC LIMIT 1"
                 ),
                 conn,
@@ -102,7 +105,8 @@ def main() -> None:
             )
             bs_chart = pd.read_sql_query(
                 text(
-                    "SELECT ts, r_t, sigma_h, k_vol_eff, none_ewma "
+                    "SELECT ts, r_t, sigma_h, k_vol_eff, none_ewma, "
+                    "r_min_eff, cost_roundtrip_est, spread_bps_med "
                     "FROM barrier_state WHERE symbol = :sym "
                     "ORDER BY ts DESC LIMIT 720"
                 ),
@@ -127,18 +131,26 @@ def main() -> None:
 
     if not bs_latest.empty:
         row = bs_latest.iloc[0]
-        bc1, bc2, bc3, bc4 = st.columns(4)
+        bc1, bc2, bc3, bc4, bc5, bc6 = st.columns(6)
         bc1.metric("r_t", f"{row['r_t']:.6f}")
         bc2.metric("sigma_h", f"{row['sigma_h']:.8f}" if pd.notna(row["sigma_h"]) else "N/A")
         bc3.metric("Status", row["status"])
         bc4.metric("sample_n", int(row["sample_n"]) if pd.notna(row["sample_n"]) else 0)
+        bc5.metric("r_min_eff", f"{row['r_min_eff']:.6f}" if pd.notna(row.get("r_min_eff")) else "N/A")
+        bc6.metric("cost_roundtrip", f"{row['cost_roundtrip_est']:.6f}" if pd.notna(row.get("cost_roundtrip_est")) else "N/A")
 
     if not bs_chart.empty:
         bsc = bs_chart.sort_values("ts").set_index("ts")
 
+        st.subheader("r_t vs r_min_eff vs cost_roundtrip — Time Series")
+        cost_cols = ["r_t", "r_min_eff", "cost_roundtrip_est"]
+        cost_data = bsc[cost_cols].dropna(how="all")
+        if not cost_data.empty:
+            st.line_chart(cost_data)
+
         st.subheader("r_t / k_vol_eff / none_ewma — Time Series")
-        chart_sel = st.selectbox("Select chart", ["r_t", "k_vol_eff", "none_ewma", "sigma_h"])
-        col_data = bsc[chart_sel].dropna()
+        chart_sel = st.selectbox("Select chart", ["r_t", "k_vol_eff", "none_ewma", "sigma_h", "spread_bps_med"])
+        col_data = bsc[chart_sel].dropna() if chart_sel in bsc.columns else pd.Series(dtype=float)
         if not col_data.empty:
             st.line_chart(col_data)
 
@@ -405,7 +417,7 @@ def main() -> None:
         with engine.connect() as conn:
             pd_df = pd.read_sql_query(
                 text(
-                    "SELECT ts, pos_status, action, reason, ev_rate, p_none, "
+                    "SELECT ts, pos_status, action, reason, reason_flags, ev_rate, p_none, "
                     "spread_bps, lag_sec, cost_roundtrip_est, r_t "
                     "FROM paper_decisions WHERE symbol = :sym ORDER BY ts DESC LIMIT 60"
                 ),
@@ -419,8 +431,8 @@ def main() -> None:
     if not pd_df.empty:
         st.dataframe(pd_df, use_container_width=True, height=400)
 
-    # Why no trades? — reason distribution
-    st.subheader("Why no trades? — Decision Reason Distribution (last 500)")
+    # Why no trades? — primary reason distribution
+    st.subheader("Primary Reason Distribution (last 500)")
     try:
         with engine.connect() as conn:
             reason_dist = pd.read_sql_query(
@@ -445,6 +457,43 @@ def main() -> None:
         st.bar_chart(reason_dist.set_index("reason")["cnt"])
     else:
         st.info("No decision data yet.")
+
+    # Flag-level distribution (reason_flags JSON)
+    st.subheader("Reason Flags Distribution — All flags (last 500)")
+    try:
+        with engine.connect() as conn:
+            flags_raw = conn.execute(
+                text("""
+                    SELECT reason_flags FROM paper_decisions
+                    WHERE symbol = :sym AND reason_flags IS NOT NULL
+                    ORDER BY ts DESC LIMIT 500
+                """),
+                {"sym": settings.SYMBOL},
+            ).fetchall()
+    except Exception as e:
+        st.warning(f"reason_flags not available: {e}")
+        flags_raw = []
+
+    if flags_raw:
+        flag_counts: dict[str, int] = {}
+        for row in flags_raw:
+            try:
+                flags_list = json.loads(row.reason_flags)
+                for f in flags_list:
+                    flag_counts[f] = flag_counts.get(f, 0) + 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if flag_counts:
+            fc_df = pd.DataFrame(
+                sorted(flag_counts.items(), key=lambda x: -x[1]),
+                columns=["flag", "count"],
+            )
+            st.dataframe(fc_df, use_container_width=True)
+            st.bar_chart(fc_df.set_index("flag")["count"])
+        else:
+            st.info("No flags parsed yet.")
+    else:
+        st.info("No reason_flags data yet.")
 
 
 if __name__ == "__main__":

@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     EVAL_WINDOW_N: int = 500
     DASH_PRED_WINDOW_N: int = 200
 
+    # Cost-based r_t floor
+    R_MIN_COST_MULT: float = 1.10
+    COST_SPREAD_LOOKBACK_SEC: int = 60
+
     # Paper trading
     PAPER_TRADING_ENABLED: bool = True
     PAPER_INITIAL_KRW: float = 1_000_000

@@ -22,6 +22,12 @@ WHERE symbol = :symbol AND ts >= :since
 ORDER BY ts ASC
 """)
 
+_FETCH_SPREAD_MED_SQL = text("""
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_bps) AS spread_bps_med
+FROM market_1s
+WHERE symbol = :symbol AND ts >= :since AND spread_bps IS NOT NULL
+""")
+
 
 class BarrierController:
     def __init__(self, settings: Settings, engine: Engine) -> None:
@@ -77,14 +83,38 @@ class BarrierController:
 
         return {"sigma_1s": sigma_1s, "sigma_dt": sigma_dt, "sample_n": len(log_returns)}
 
-    def compute_r_t(self, sigma_1s: float | None, k_vol_eff: float) -> tuple[float | None, float]:
+    def compute_spread_median(self, symbol: str, now_utc: datetime) -> float | None:
+        """Fetch median spread_bps from market_1s over COST_SPREAD_LOOKBACK_SEC."""
+        since = now_utc - timedelta(seconds=self.settings.COST_SPREAD_LOOKBACK_SEC)
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                _FETCH_SPREAD_MED_SQL, {"symbol": symbol, "since": since}
+            ).fetchone()
+        if row is None or row.spread_bps_med is None:
+            return None
+        return float(row.spread_bps_med)
+
+    def compute_cost_roundtrip(self, spread_bps_med: float | None) -> float:
+        """Compute roundtrip cost = EV_COST_MULT * (2*fee + 2*slip + spread)."""
+        fee_round = 2 * self.settings.FEE_RATE
+        slip_round = 2 * (self.settings.SLIPPAGE_BPS / 10000.0)
+        spread_round = (spread_bps_med / 10000.0) if spread_bps_med is not None else 0.0
+        return self.settings.EV_COST_MULT * (fee_round + slip_round + spread_round)
+
+    def compute_r_t(
+        self, sigma_1s: float | None, k_vol_eff: float,
+        cost_roundtrip_est: float = 0.0,
+    ) -> tuple[float | None, float, float]:
+        """Return (sigma_h, r_t, r_min_eff)."""
+        r_min_eff = max(self.settings.R_MIN, self.settings.R_MIN_COST_MULT * cost_roundtrip_est)
+
         if sigma_1s is None:
-            return None, self.settings.R_MIN
+            return None, r_min_eff, r_min_eff
 
         sigma_h = sigma_1s * math.sqrt(self.settings.H_SEC)
-        r_t = max(self.settings.R_MIN, k_vol_eff * sigma_h)
+        r_t = max(r_min_eff, k_vol_eff * sigma_h)
         r_t = min(r_t, self.settings.R_MAX)
-        return sigma_h, r_t
+        return sigma_h, r_t, r_min_eff
 
     def _warmup_threshold(self) -> int:
         dt = max(1, self.settings.VOL_DT_SEC)
@@ -92,7 +122,10 @@ class BarrierController:
 
     def _build_row(
         self, ts: datetime, result: dict, sigma_h: float | None,
-        r_t: float, status: str, error: str | None, params: dict
+        r_t: float, status: str, error: str | None, params: dict,
+        spread_bps_med: float | None = None,
+        cost_roundtrip_est: float | None = None,
+        r_min_eff: float | None = None,
     ) -> dict:
         return {
             "ts": ts,
@@ -114,6 +147,10 @@ class BarrierController:
             "ewma_alpha": self.settings.EWMA_ALPHA,
             "ewma_eta": self.settings.EWMA_ETA,
             "vol_dt_sec": self.settings.VOL_DT_SEC,
+            # v1.1 cost-based floor
+            "spread_bps_med": spread_bps_med,
+            "cost_roundtrip_est": cost_roundtrip_est,
+            "r_min_eff": r_min_eff,
         }
 
     async def run(self) -> None:
@@ -131,24 +168,40 @@ class BarrierController:
                 result = await asyncio.to_thread(
                     self.compute_sigma_from_db, self.settings.SYMBOL, ts_utc
                 )
-                sigma_h, r_t = self.compute_r_t(result.get("sigma_1s"), k_vol_eff)
+
+                # Cost-based r_min_eff
+                spread_bps_med = await asyncio.to_thread(
+                    self.compute_spread_median, self.settings.SYMBOL, ts_utc
+                )
+                cost_roundtrip_est = self.compute_cost_roundtrip(spread_bps_med)
+
+                sigma_h, r_t, r_min_eff = self.compute_r_t(
+                    result.get("sigma_1s"), k_vol_eff, cost_roundtrip_est
+                )
                 sample_n = result.get("sample_n", 0)
 
                 if sample_n < self._warmup_threshold():
                     status = "WARMUP"
-                    r_t = self.settings.R_MIN
+                    r_t = r_min_eff
                 else:
                     status = "OK"
 
-                row = self._build_row(ts_utc, result, sigma_h, r_t, status, None, params)
+                row = self._build_row(
+                    ts_utc, result, sigma_h, r_t, status, None, params,
+                    spread_bps_med=spread_bps_med,
+                    cost_roundtrip_est=cost_roundtrip_est,
+                    r_min_eff=r_min_eff,
+                )
                 await asyncio.to_thread(upsert_barrier_state, self.engine, row)
 
                 self.last_r_t = r_t
                 self.last_status = status
 
                 log.info(
-                    "Barrier: r_t=%.6f sigma_1s=%s sigma_h=%s status=%s sample_n=%d k_eff=%.4f",
+                    "Barrier: r_t=%.6f r_min_eff=%.6f cost=%.6f sigma_1s=%s sigma_h=%s status=%s n=%d k_eff=%.4f",
                     r_t,
+                    r_min_eff,
+                    cost_roundtrip_est,
                     f"{result['sigma_1s']:.8f}" if result.get("sigma_1s") is not None else "N/A",
                     f"{sigma_h:.8f}" if sigma_h is not None else "N/A",
                     status,
@@ -167,6 +220,9 @@ class BarrierController:
                         "ERROR",
                         str(__import__("traceback").format_exc()[-500:]),
                         params,
+                        spread_bps_med=None,
+                        cost_roundtrip_est=None,
+                        r_min_eff=None,
                     )
                     await asyncio.to_thread(upsert_barrier_state, self.engine, error_row)
                 except Exception:

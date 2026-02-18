@@ -36,6 +36,10 @@ _MIG_BARRIER_STATE = [
     "ewma_alpha DOUBLE PRECISION",
     "ewma_eta DOUBLE PRECISION",
     "vol_dt_sec INTEGER",
+    # v1.1: cost-based r_t floor
+    "spread_bps_med DOUBLE PRECISION",
+    "cost_roundtrip_est DOUBLE PRECISION",
+    "r_min_eff DOUBLE PRECISION",
 ]
 
 # ---------------------------------------------------------------------------
@@ -88,6 +92,14 @@ CREATE TABLE IF NOT EXISTS barrier_params (
 """)
 
 
+# ---------------------------------------------------------------------------
+# (6) paper_decisions: multi-flag reason
+# ---------------------------------------------------------------------------
+_MIG_PAPER_DECISIONS = [
+    "reason_flags TEXT",
+]
+
+
 def _add_columns(conn, table: str, col_defs: list[str], label: str) -> None:
     """Add columns to a table using ADD COLUMN IF NOT EXISTS (PG 9.6+)."""
     for col_def in col_defs:
@@ -117,5 +129,8 @@ def apply_migrations(engine: Engine) -> None:
         # (5) barrier_params table
         conn.execute(_CREATE_BARRIER_PARAMS)
         log.info("Applied: barrier_params table (CREATE IF NOT EXISTS)")
+
+        # (6) paper_decisions multi-flag
+        _add_columns(conn, "paper_decisions", _MIG_PAPER_DECISIONS, "paper_decisions reason_flags")
 
     log.info("All v1 migrations complete")
