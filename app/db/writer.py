@@ -351,3 +351,36 @@ def insert_paper_trade(engine: Engine, trade: dict) -> None:
 def insert_paper_decision(engine: Engine, decision: dict) -> None:
     with engine.begin() as conn:
         conn.execute(_INSERT_PAPER_DECISION, decision)
+
+
+# ---------------------------------------------------------------------------
+# Upbit Exchange (Step 7)
+# ---------------------------------------------------------------------------
+
+_INSERT_UPBIT_ACCOUNT_SNAPSHOT = text("""
+INSERT INTO upbit_account_snapshots
+    (ts, symbol, currency, balance, locked,
+     avg_buy_price, avg_buy_price_modified, unit_currency, raw_json)
+VALUES
+    (:ts, :symbol, :currency, :balance, :locked,
+     :avg_buy_price, :avg_buy_price_modified, :unit_currency, :raw_json)
+""")
+
+_INSERT_UPBIT_ORDER_ATTEMPT = text("""
+INSERT INTO upbit_order_attempts
+    (ts, symbol, action, mode, side, ord_type,
+     price, volume, paper_trade_id, response_json, status, error_msg)
+VALUES
+    (:ts, :symbol, :action, :mode, :side, :ord_type,
+     :price, :volume, :paper_trade_id, :response_json, :status, :error_msg)
+""")
+
+
+def insert_upbit_account_snapshot(engine: Engine, row: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_INSERT_UPBIT_ACCOUNT_SNAPSHOT, row)
+
+
+def insert_upbit_order_attempt(engine: Engine, row: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_INSERT_UPBIT_ORDER_ATTEMPT, row)

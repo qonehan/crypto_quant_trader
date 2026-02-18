@@ -16,6 +16,8 @@ sqlalchemy = "^2.0.0"
 psycopg = {version = "^3.1.0", extras = ["binary"]}
 streamlit = "^1.0.0"
 pandas = "^2.0.0"
+httpx = "^0.28.1"
+pyjwt = "^2.11.0"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.5.0"

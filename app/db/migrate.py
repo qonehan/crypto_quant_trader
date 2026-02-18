@@ -119,6 +119,66 @@ _MIG_PAPER_POSITIONS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# (8) upbit_account_snapshots table (Step 7)
+# ---------------------------------------------------------------------------
+_CREATE_UPBIT_ACCOUNT_SNAPSHOTS = text("""
+CREATE TABLE IF NOT EXISTS upbit_account_snapshots (
+    id                      BIGSERIAL PRIMARY KEY,
+    ts                      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    symbol                  TEXT NOT NULL,
+    currency                TEXT NOT NULL,
+    balance                 DOUBLE PRECISION NOT NULL,
+    locked                  DOUBLE PRECISION NOT NULL,
+    avg_buy_price           DOUBLE PRECISION,
+    avg_buy_price_modified  BOOLEAN,
+    unit_currency           TEXT,
+    raw_json                JSONB
+)
+""")
+
+_CREATE_IDX_ACCOUNT_SNAPSHOTS_TS = text("""
+CREATE INDEX IF NOT EXISTS ix_upbit_account_snapshots_ts
+ON upbit_account_snapshots (ts)
+""")
+
+_CREATE_IDX_ACCOUNT_SNAPSHOTS_SYM_CUR = text("""
+CREATE INDEX IF NOT EXISTS ix_upbit_account_snapshots_symbol_currency
+ON upbit_account_snapshots (symbol, currency)
+""")
+
+# ---------------------------------------------------------------------------
+# (9) upbit_order_attempts table (Step 7)
+# ---------------------------------------------------------------------------
+_CREATE_UPBIT_ORDER_ATTEMPTS = text("""
+CREATE TABLE IF NOT EXISTS upbit_order_attempts (
+    id              BIGSERIAL PRIMARY KEY,
+    ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    symbol          TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    mode            TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    ord_type        TEXT NOT NULL,
+    price           DOUBLE PRECISION,
+    volume          DOUBLE PRECISION,
+    paper_trade_id  BIGINT,
+    response_json   JSONB,
+    status          TEXT NOT NULL,
+    error_msg       TEXT
+)
+""")
+
+_CREATE_IDX_ORDER_ATTEMPTS_TS = text("""
+CREATE INDEX IF NOT EXISTS ix_upbit_order_attempts_ts
+ON upbit_order_attempts (ts)
+""")
+
+_CREATE_IDX_ORDER_ATTEMPTS_SYM_TS = text("""
+CREATE INDEX IF NOT EXISTS ix_upbit_order_attempts_symbol_ts
+ON upbit_order_attempts (symbol, ts)
+""")
+
+
 def _add_columns(conn, table: str, col_defs: list[str], label: str) -> None:
     """Add columns to a table using ADD COLUMN IF NOT EXISTS (PG 9.6+)."""
     for col_def in col_defs:
@@ -155,4 +215,16 @@ def apply_migrations(engine: Engine) -> None:
         # (7) paper_positions risk management
         _add_columns(conn, "paper_positions", _MIG_PAPER_POSITIONS, "paper_positions risk mgmt")
 
-    log.info("All v1 migrations complete")
+        # (8) upbit_account_snapshots table
+        conn.execute(_CREATE_UPBIT_ACCOUNT_SNAPSHOTS)
+        conn.execute(_CREATE_IDX_ACCOUNT_SNAPSHOTS_TS)
+        conn.execute(_CREATE_IDX_ACCOUNT_SNAPSHOTS_SYM_CUR)
+        log.info("Applied: upbit_account_snapshots table (CREATE IF NOT EXISTS)")
+
+        # (9) upbit_order_attempts table
+        conn.execute(_CREATE_UPBIT_ORDER_ATTEMPTS)
+        conn.execute(_CREATE_IDX_ORDER_ATTEMPTS_TS)
+        conn.execute(_CREATE_IDX_ORDER_ATTEMPTS_SYM_TS)
+        log.info("Applied: upbit_order_attempts table (CREATE IF NOT EXISTS)")
+
+    log.info("All migrations complete (v1 + Step 7)")

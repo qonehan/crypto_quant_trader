@@ -86,6 +86,21 @@ class Settings(BaseSettings):
 
     MODE: str = "paper"
 
+    # Upbit REST API
+    UPBIT_ACCESS_KEY: str = ""
+    UPBIT_SECRET_KEY: str = ""
+    UPBIT_API_BASE: str = "https://api.upbit.com"
+    UPBIT_ACCOUNT_POLL_SEC: int = 30
+    UPBIT_REST_TIMEOUT_SEC: float = 10.0
+    UPBIT_REST_MAX_RETRY: int = 3
+
+    # Shadow / Live trading safety (3-layer guard)
+    UPBIT_SHADOW_ENABLED: bool = True
+    UPBIT_ORDER_TEST_ENABLED: bool = False
+    LIVE_TRADING_ENABLED: bool = False
+    UPBIT_TRADE_MODE: str = "shadow"  # shadow | live
+    LIVE_GUARD_PHRASE: str = ""  # must be "I_CONFIRM_LIVE_TRADING" to enable live
+
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
 
 

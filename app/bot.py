@@ -16,6 +16,7 @@ from app.marketdata.state import MarketState
 from app.marketdata.upbit_ws import UpbitWsClient
 from app.models.baseline_v1 import BaselineModelV1
 from app.predictor.runner import PredictionRunner
+from app.exchange.runner import ShadowExecutionRunner, UpbitAccountRunner
 from app.trading.runner import PaperTradingRunner
 
 DB_RESOLVE_HINT = (
@@ -136,6 +137,18 @@ async def async_main() -> None:
     if settings.PAPER_TRADING_ENABLED:
         tasks.append(asyncio.create_task(paper_runner.run(), name="paper_trading"))
         log.info("Paper trading enabled")
+
+    if settings.UPBIT_SHADOW_ENABLED:
+        shadow_runner = ShadowExecutionRunner(settings, engine)
+        tasks.append(asyncio.create_task(shadow_runner.run(), name="shadow_execution"))
+        log.info("ShadowExecutionRunner enabled (mode=%s)", settings.UPBIT_TRADE_MODE)
+
+        if settings.UPBIT_ACCESS_KEY and settings.UPBIT_SECRET_KEY:
+            account_runner = UpbitAccountRunner(settings, engine)
+            tasks.append(asyncio.create_task(account_runner.run(), name="upbit_account"))
+            log.info("UpbitAccountRunner enabled (poll=%ds)", settings.UPBIT_ACCOUNT_POLL_SEC)
+        else:
+            log.info("UpbitAccountRunner skipped (UPBIT_ACCESS_KEY not set)")
 
     try:
         await asyncio.gather(*tasks)

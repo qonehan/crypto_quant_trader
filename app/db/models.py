@@ -325,3 +325,52 @@ class PaperDecision(Base):
 
     def __repr__(self) -> str:
         return f"<PaperDecision {self.symbol} {self.ts} {self.action} {self.reason}>"
+
+
+class UpbitAccountSnapshot(Base):
+    __tablename__ = "upbit_account_snapshots"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    ts = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    symbol = Column(Text, nullable=False)
+    currency = Column(Text, nullable=False)
+    balance = Column(Double, nullable=False)
+    locked = Column(Double, nullable=False)
+    avg_buy_price = Column(Double, nullable=True)
+    avg_buy_price_modified = Column(Boolean, nullable=True)
+    unit_currency = Column(Text, nullable=True)
+    raw_json = Column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_upbit_account_snapshots_ts", "ts"),
+        Index("ix_upbit_account_snapshots_symbol_currency", "symbol", "currency"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UpbitAccountSnapshot {self.currency} balance={self.balance} ts={self.ts}>"
+
+
+class UpbitOrderAttempt(Base):
+    __tablename__ = "upbit_order_attempts"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    ts = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    symbol = Column(Text, nullable=False)
+    action = Column(Text, nullable=False)      # ENTER_LONG | EXIT_LONG
+    mode = Column(Text, nullable=False)        # shadow | test | live
+    side = Column(Text, nullable=False)        # bid | ask
+    ord_type = Column(Text, nullable=False)    # market | limit
+    price = Column(Double, nullable=True)
+    volume = Column(Double, nullable=True)
+    paper_trade_id = Column(BigInteger, nullable=True)
+    response_json = Column(JSONB, nullable=True)
+    status = Column(Text, nullable=False)      # logged | test_ok | submitted | error
+    error_msg = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_upbit_order_attempts_ts", "ts"),
+        Index("ix_upbit_order_attempts_symbol_ts", "symbol", "ts"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UpbitOrderAttempt {self.symbol} {self.action} mode={self.mode} status={self.status}>"

@@ -592,5 +592,86 @@ def main() -> None:
         st.info("No reason_flags data yet.")
 
 
+    # ══════════════════════════════════════════════════════════
+    # [F] Upbit Exchange (Step 7)
+    # ══════════════════════════════════════════════════════════
+    st.header("[F] Upbit Exchange")
+
+    # Account snapshots — latest balances
+    st.subheader("계좌 잔액 (최신 스냅샷)")
+    try:
+        with engine.connect() as conn:
+            acct_df = pd.read_sql_query(
+                text("""
+                    SELECT DISTINCT ON (currency)
+                        ts, currency, balance, locked, avg_buy_price, unit_currency
+                    FROM upbit_account_snapshots
+                    WHERE symbol = :sym
+                    ORDER BY currency, ts DESC
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"upbit_account_snapshots not available: {e}")
+        acct_df = pd.DataFrame()
+
+    if not acct_df.empty:
+        st.dataframe(acct_df, use_container_width=True)
+        st.caption(f"스냅샷 기준: {acct_df['ts'].max()}")
+    else:
+        st.info("계좌 스냅샷 없음 (UPBIT_ACCESS_KEY 설정 및 UpbitAccountRunner 실행 필요)")
+
+    # Order attempts — recent shadow/test/live logs
+    st.subheader("주문 시도 로그 (upbit_order_attempts, 최근 30건)")
+    try:
+        with engine.connect() as conn:
+            oa_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, action, mode, side, ord_type, price, volume,
+                           paper_trade_id, status, error_msg
+                    FROM upbit_order_attempts
+                    WHERE symbol = :sym
+                    ORDER BY ts DESC LIMIT 30
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"upbit_order_attempts not available: {e}")
+        oa_df = pd.DataFrame()
+
+    if not oa_df.empty:
+        # Summary metrics
+        total = len(oa_df)
+        shadow_n = (oa_df["mode"] == "shadow").sum()
+        test_n = (oa_df["mode"] == "test").sum()
+        live_n = (oa_df["mode"] == "live").sum()
+        error_n = (oa_df["status"] == "error").sum()
+        f1, f2, f3, f4, f5 = st.columns(5)
+        f1.metric("Total", total)
+        f2.metric("Shadow", int(shadow_n))
+        f3.metric("Test", int(test_n))
+        f4.metric("Live", int(live_n))
+        f5.metric("Errors", int(error_n))
+        st.dataframe(oa_df, use_container_width=True, height=300)
+    else:
+        st.info("주문 시도 기록 없음 (ShadowExecutionRunner가 paper_trades를 감지하면 자동 생성)")
+
+    # Mode indicator
+    mode_color = "🟢" if settings.UPBIT_SHADOW_ENABLED else "⚫"
+    live_guard = (
+        settings.LIVE_TRADING_ENABLED
+        and settings.UPBIT_TRADE_MODE == "live"
+        and settings.LIVE_GUARD_PHRASE == "I_CONFIRM_LIVE_TRADING"
+    )
+    st.info(
+        f"{mode_color} Shadow: {settings.UPBIT_SHADOW_ENABLED}  |  "
+        f"Trade mode: {settings.UPBIT_TRADE_MODE}  |  "
+        f"Live guard: {'🔴 LIVE' if live_guard else '🟢 SAFE'}  |  "
+        f"API key: {'✅ set' if settings.UPBIT_ACCESS_KEY else '❌ not set'}"
+    )
+
+
 if __name__ == "__main__":
     main()
