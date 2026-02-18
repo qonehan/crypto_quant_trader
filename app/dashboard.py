@@ -5,6 +5,7 @@ from sqlalchemy import text
 
 from app.config import load_settings
 from app.db.session import get_engine
+from app.evaluator.evaluator import compute_calibration
 
 DB_RESOLVE_HINT = (
     "DB host 'db'를 찾지 못했습니다. "
@@ -15,16 +16,15 @@ DB_RESOLVE_HINT = (
 
 
 def main() -> None:
-    st.set_page_config(page_title="BTC Quant Bot", layout="wide")
-    st.title("BTC Quant Bot - Prototype v0")
+    st.set_page_config(page_title="BTC Quant Bot v1", layout="wide")
+    st.title("BTC Quant Bot - v1 Dashboard")
 
     settings = load_settings()
+    now_utc = datetime.now(timezone.utc)
 
     st.subheader("Settings")
-    st.write(f"**SYMBOL:** {settings.SYMBOL}")
-    st.write(f"**MODE:** {settings.MODE}")
+    st.write(f"**SYMBOL:** {settings.SYMBOL}  |  **MODE:** {settings.MODE}")
 
-    st.subheader("DB Connection Test")
     try:
         engine = get_engine(settings)
         with engine.connect() as conn:
@@ -44,7 +44,6 @@ def main() -> None:
 
     try:
         with engine.connect() as conn:
-            # last 60 rows
             df60 = pd.read_sql_query(
                 text(
                     "SELECT ts, symbol, mid, bid, ask, spread, trade_count_1s, "
@@ -53,7 +52,6 @@ def main() -> None:
                 ),
                 conn,
             )
-            # last 300 rows for chart
             df300 = pd.read_sql_query(
                 text("SELECT ts, mid FROM market_1s ORDER BY ts DESC LIMIT 300"),
                 conn,
@@ -66,190 +64,284 @@ def main() -> None:
         st.info("No market_1s rows yet. Start the bot first.")
         return
 
-    # lag
     last_ts = pd.to_datetime(df60["ts"].iloc[0], utc=True)
-    now_utc = datetime.now(timezone.utc)
     lag_sec = (now_utc - last_ts).total_seconds()
     st.metric("Lag (sec)", f"{lag_sec:.1f}")
 
     st.dataframe(df60, use_container_width=True, height=400)
 
-    # mid chart (5 min)
     if not df300.empty:
         st.subheader("Mid Price — Last 5 min")
-        chart_df = df300.sort_values("ts")
-        chart_df = chart_df.set_index("ts")
+        chart_df = df300.sort_values("ts").set_index("ts")
         st.line_chart(chart_df["mid"])
 
-    # ── Barrier State ──────────────────────────────────────
-    st.subheader("Barrier State")
+    # ══════════════════════════════════════════════════════════
+    # [A] Barrier Feedback
+    # ══════════════════════════════════════════════════════════
+    st.header("[A] Barrier Feedback")
 
     try:
         with engine.connect() as conn:
+            bp_df = pd.read_sql_query(
+                text(
+                    "SELECT symbol, k_vol_eff, none_ewma, target_none, "
+                    "ewma_alpha, ewma_eta, updated_at "
+                    "FROM barrier_params WHERE symbol = :sym"
+                ),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
             bs_latest = pd.read_sql_query(
                 text(
                     "SELECT ts, symbol, r_t, sigma_1s, sigma_h, status, sample_n, "
-                    "h_sec, vol_window_sec, r_min, k_vol, error "
-                    "FROM barrier_state ORDER BY ts DESC LIMIT 1"
+                    "h_sec, vol_window_sec, r_min, k_vol, k_vol_eff, none_ewma "
+                    "FROM barrier_state WHERE symbol = :sym ORDER BY ts DESC LIMIT 1"
                 ),
                 conn,
-            )
-            bs_recent = pd.read_sql_query(
-                text(
-                    "SELECT ts, symbol, r_t, sigma_1s, sigma_h, status, sample_n "
-                    "FROM barrier_state ORDER BY ts DESC LIMIT 20"
-                ),
-                conn,
+                params={"sym": settings.SYMBOL},
             )
             bs_chart = pd.read_sql_query(
                 text(
-                    "SELECT ts, r_t, sigma_h "
-                    "FROM barrier_state ORDER BY ts DESC LIMIT 360"
+                    "SELECT ts, r_t, sigma_h, k_vol_eff, none_ewma "
+                    "FROM barrier_state WHERE symbol = :sym "
+                    "ORDER BY ts DESC LIMIT 720"
                 ),
                 conn,
+                params={"sym": settings.SYMBOL},
             )
     except Exception as e:
-        st.warning(f"barrier_state table not available yet: {e}")
+        st.warning(f"barrier data not available: {e}")
+        bp_df = pd.DataFrame()
         bs_latest = pd.DataFrame()
-        bs_recent = pd.DataFrame()
         bs_chart = pd.DataFrame()
 
-    if bs_latest.empty:
-        st.info("No barrier_state rows yet. Wait for the first decision tick.")
-    else:
+    if not bp_df.empty:
+        bp = bp_df.iloc[0]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("k_vol_eff", f"{bp['k_vol_eff']:.4f}")
+        c2.metric("none_ewma", f"{bp['none_ewma']:.4f}")
+        c3.metric("target_none", f"{bp['target_none']:.2f}")
+        c4.metric("ewma_alpha", f"{bp['ewma_alpha']:.2f}")
+        c5.metric("ewma_eta", f"{bp['ewma_eta']:.2f}")
+        st.caption(f"Updated at: {bp['updated_at']}")
+
+    if not bs_latest.empty:
         row = bs_latest.iloc[0]
-        barrier_ts = pd.to_datetime(row["ts"], utc=True)
-        barrier_lag = (now_utc - barrier_ts).total_seconds()
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("r_t", f"{row['r_t']:.6f}")
-        col2.metric("sigma_h", f"{row['sigma_h']:.8f}" if pd.notna(row["sigma_h"]) else "N/A")
-        col3.metric("Status", row["status"])
-        col4.metric("Barrier Lag (sec)", f"{barrier_lag:.1f}")
-
-        st.write(
-            f"**sample_n:** {row['sample_n']}  |  "
-            f"**h_sec:** {row['h_sec']}  |  "
-            f"**vol_window_sec:** {row['vol_window_sec']}  |  "
-            f"**sigma_1s:** {row['sigma_1s']:.8f}" if pd.notna(row.get("sigma_1s")) else
-            f"**sample_n:** {row['sample_n']}  |  "
-            f"**h_sec:** {row['h_sec']}  |  "
-            f"**vol_window_sec:** {row['vol_window_sec']}  |  "
-            f"**sigma_1s:** N/A"
-        )
+        bc1, bc2, bc3, bc4 = st.columns(4)
+        bc1.metric("r_t", f"{row['r_t']:.6f}")
+        bc2.metric("sigma_h", f"{row['sigma_h']:.8f}" if pd.notna(row["sigma_h"]) else "N/A")
+        bc3.metric("Status", row["status"])
+        bc4.metric("sample_n", int(row["sample_n"]) if pd.notna(row["sample_n"]) else 0)
 
     if not bs_chart.empty:
-        st.subheader("r_t — Last 30 min")
-        c1 = bs_chart.sort_values("ts").set_index("ts")
-        st.line_chart(c1["r_t"])
+        bsc = bs_chart.sort_values("ts").set_index("ts")
 
-        st.subheader("sigma_h — Last 30 min")
-        c2 = c1.dropna(subset=["sigma_h"])
-        if not c2.empty:
-            st.line_chart(c2["sigma_h"])
+        st.subheader("r_t / k_vol_eff / none_ewma — Time Series")
+        chart_sel = st.selectbox("Select chart", ["r_t", "k_vol_eff", "none_ewma", "sigma_h"])
+        col_data = bsc[chart_sel].dropna()
+        if not col_data.empty:
+            st.line_chart(col_data)
 
-    if not bs_recent.empty:
-        st.subheader("barrier_state — Recent 20 rows")
-        st.dataframe(bs_recent, use_container_width=True, height=400)
+    # ══════════════════════════════════════════════════════════
+    # [B] Probabilistic Metrics
+    # ══════════════════════════════════════════════════════════
+    st.header("[B] Probabilistic Metrics")
 
+    eval_n = settings.EVAL_WINDOW_N
+    try:
+        with engine.connect() as conn:
+            eval_agg = pd.read_sql_query(
+                text("""
+                    SELECT count(*) as n,
+                           avg(brier) as mean_brier,
+                           avg(logloss) as mean_logloss,
+                           avg(case when actual_direction='NONE' then 1 else 0 end) as none_rate,
+                           avg(case when actual_direction='UP' then 1 else 0 end) as up_rate,
+                           avg(case when actual_direction='DOWN' then 1 else 0 end) as down_rate,
+                           avg(case when direction_hat = actual_direction then 1 else 0 end) as accuracy,
+                           avg(case when touch_time_sec is not null then 1 else 0 end) as hit_rate
+                    FROM (
+                        SELECT * FROM evaluation_results
+                        WHERE symbol = :sym AND label_version='exec_v1'
+                          AND brier IS NOT NULL AND logloss IS NOT NULL
+                        ORDER BY t0 DESC LIMIT :n
+                    ) sub
+                """),
+                conn,
+                params={"sym": settings.SYMBOL, "n": eval_n},
+            )
+    except Exception as e:
+        st.warning(f"evaluation_results not available: {e}")
+        eval_agg = pd.DataFrame()
 
-    # ── Predictions ──────────────────────────────────────
-    st.subheader("Predictions")
+    if not eval_agg.empty and eval_agg.iloc[0]["n"] > 0:
+        ea = eval_agg.iloc[0]
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("N", int(ea["n"]))
+        m2.metric("Accuracy", f"{ea['accuracy']:.3f}")
+        m3.metric("Hit Rate", f"{ea['hit_rate']:.3f}")
+        m4.metric("None Rate", f"{ea['none_rate']:.3f}")
+        m5.metric("Mean Brier", f"{ea['mean_brier']:.4f}")
+        m6.metric("Mean LogLoss", f"{ea['mean_logloss']:.4f}")
+
+        st.caption(f"Actual distribution: UP={ea['up_rate']:.3f} DOWN={ea['down_rate']:.3f} NONE={ea['none_rate']:.3f}")
+    else:
+        st.info("No exec_v1 evaluation results yet.")
+
+    # ══════════════════════════════════════════════════════════
+    # [C] Calibration Tables
+    # ══════════════════════════════════════════════════════════
+    st.header("[C] Calibration Tables")
+
+    try:
+        with engine.connect() as conn:
+            calib_rows = conn.execute(
+                text("""
+                    SELECT p_up, p_down, p_none, actual_direction
+                    FROM evaluation_results
+                    WHERE symbol = :sym AND label_version='exec_v1'
+                      AND brier IS NOT NULL AND logloss IS NOT NULL
+                    ORDER BY t0 DESC LIMIT :n
+                """),
+                {"sym": settings.SYMBOL, "n": eval_n},
+            ).fetchall()
+    except Exception as e:
+        st.warning(f"calibration data not available: {e}")
+        calib_rows = []
+
+    if calib_rows:
+        for cls in ("UP", "DOWN", "NONE"):
+            calib = compute_calibration(calib_rows, cls)
+            calib_df = pd.DataFrame(calib)
+
+            # ECE
+            total_count = calib_df["count"].sum()
+            if total_count > 0:
+                ece = (calib_df["abs_gap"] * calib_df["count"]).sum() / total_count
+            else:
+                ece = 0.0
+
+            st.subheader(f"Calibration: {cls}  (ECE = {ece:.4f})")
+            non_empty = calib_df[calib_df["count"] > 0]
+            if not non_empty.empty:
+                st.dataframe(non_empty, use_container_width=True)
+            else:
+                st.info(f"No samples for {cls}")
+    else:
+        st.info("No calibration data yet.")
+
+    # ══════════════════════════════════════════════════════════
+    # [D] EV/Cost Diagnostic Panel
+    # ══════════════════════════════════════════════════════════
+    st.header("[D] EV/Cost Diagnostic Panel")
+
+    pred_n = settings.DASH_PRED_WINDOW_N
+    try:
+        with engine.connect() as conn:
+            pred_diag = pd.read_sql_query(
+                text("""
+                    SELECT ev, ev_rate, p_none, spread_bps, action_hat
+                    FROM predictions
+                    WHERE symbol = :sym AND ev IS NOT NULL
+                    ORDER BY t0 DESC LIMIT :n
+                """),
+                conn,
+                params={"sym": settings.SYMBOL, "n": pred_n},
+            )
+    except Exception as e:
+        st.warning(f"predictions data not available: {e}")
+        pred_diag = pd.DataFrame()
+
+    if not pred_diag.empty:
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("EV mean", f"{pred_diag['ev'].mean():.8f}")
+        d1.metric("EV median", f"{pred_diag['ev'].median():.8f}")
+        d2.metric("EV_rate mean", f"{pred_diag['ev_rate'].mean():.2e}" if pred_diag['ev_rate'].notna().any() else "N/A")
+        d2.metric("EV_rate median", f"{pred_diag['ev_rate'].median():.2e}" if pred_diag['ev_rate'].notna().any() else "N/A")
+        d3.metric("p_none mean", f"{pred_diag['p_none'].mean():.4f}")
+        d3.metric("p_none median", f"{pred_diag['p_none'].median():.4f}")
+
+        spd = pred_diag['spread_bps'].dropna()
+        d4.metric("spread_bps mean", f"{spd.mean():.2f}" if not spd.empty else "N/A")
+        d4.metric("spread_bps median", f"{spd.median():.2f}" if not spd.empty else "N/A")
+
+        # action_hat distribution
+        if "action_hat" in pred_diag.columns:
+            action_counts = pred_diag["action_hat"].value_counts()
+            st.subheader("action_hat Distribution")
+            st.bar_chart(action_counts)
+
+        # Cost breakdown
+        st.subheader("Cost Breakdown (estimated)")
+        fee_round = 2 * settings.FEE_RATE
+        slip_round = 2 * (settings.SLIPPAGE_BPS / 10000.0)
+        spread_median = spd.median() / 10000.0 if not spd.empty else 0.0
+        cost_est = settings.EV_COST_MULT * (fee_round + slip_round + spread_median)
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("fee_round (2*FEE_RATE)", f"{fee_round:.6f}")
+        cc2.metric("slip_round (2*SLIP/1e4)", f"{slip_round:.6f}")
+        cc3.metric("spread_round (median)", f"{spread_median:.6f}")
+        cc4.metric("cost_roundtrip_est", f"{cost_est:.6f}")
+
+        st.info(
+            f"cost_roundtrip = EV_COST_MULT({settings.EV_COST_MULT}) * "
+            f"(fee_round({fee_round:.6f}) + slip_round({slip_round:.6f}) + "
+            f"spread_round({spread_median:.6f})) = **{cost_est:.6f}**"
+        )
+    else:
+        st.info("No prediction data for EV/Cost diagnostics yet.")
+
+    # ── Predictions Table ──────────────────────────────────────
+    st.header("Predictions — Recent 20")
 
     try:
         with engine.connect() as conn:
             pred_recent = pd.read_sql_query(
                 text(
-                    "SELECT t0, r_t, p_up, p_down, p_none, t_up, t_down, "
-                    "slope_pred, ev, direction_hat, status "
-                    "FROM predictions ORDER BY t0 DESC LIMIT 20"
+                    "SELECT t0, r_t, p_up, p_down, p_none, z_barrier, "
+                    "ev, ev_rate, action_hat, model_version, status "
+                    "FROM predictions WHERE symbol = :sym ORDER BY t0 DESC LIMIT 20"
                 ),
                 conn,
-            )
-            pred_chart = pd.read_sql_query(
-                text(
-                    "SELECT t0, slope_pred, ev "
-                    "FROM predictions ORDER BY t0 DESC LIMIT 360"
-                ),
-                conn,
+                params={"sym": settings.SYMBOL},
             )
     except Exception as e:
-        st.warning(f"predictions table not available yet: {e}")
+        st.warning(f"predictions table not available: {e}")
         pred_recent = pd.DataFrame()
-        pred_chart = pd.DataFrame()
 
-    if pred_recent.empty:
-        st.info("No prediction rows yet. Wait for the first decision tick.")
-    else:
+    if not pred_recent.empty:
         pr = pred_recent.iloc[0]
-        pred_ts = pd.to_datetime(pr["t0"], utc=True)
-        pred_lag = (now_utc - pred_ts).total_seconds()
-
         pc1, pc2, pc3, pc4 = st.columns(4)
-        pc1.metric("direction_hat", pr["direction_hat"])
+        pc1.metric("action_hat", pr.get("action_hat", "N/A"))
         pc2.metric("EV", f"{pr['ev']:.8f}")
-        pc3.metric("slope_pred", f"{pr['slope_pred']:.8f}")
-        pc4.metric("Pred Lag (sec)", f"{pred_lag:.1f}")
+        pc3.metric("ev_rate", f"{pr['ev_rate']:.2e}" if pd.notna(pr.get("ev_rate")) else "N/A")
+        pc4.metric("model_version", pr.get("model_version", "N/A"))
 
         st.dataframe(pred_recent, use_container_width=True, height=400)
 
-    if not pred_chart.empty:
-        pc = pred_chart.sort_values("t0").set_index("t0")
-
-        st.subheader("slope_pred — Last 30 min")
-        st.line_chart(pc["slope_pred"])
-
-        st.subheader("EV — Last 30 min")
-        st.line_chart(pc["ev"])
-
-
     # ── Evaluation Results ──────────────────────────────────────
-    st.subheader("Evaluation Results")
+    st.header("Evaluation Results — Recent 20")
 
     try:
         with engine.connect() as conn:
             eval_recent = pd.read_sql_query(
                 text(
                     "SELECT t0, r_t, direction_hat, actual_direction, actual_r_t, "
-                    "touch_time_sec, ev, slope_pred, error, status "
-                    "FROM evaluation_results ORDER BY t0 DESC LIMIT 20"
+                    "touch_time_sec, brier, logloss, status "
+                    "FROM evaluation_results WHERE symbol = :sym ORDER BY t0 DESC LIMIT 20"
                 ),
                 conn,
-            )
-            eval_stats = pd.read_sql_query(
-                text("""
-                    SELECT
-                        count(*) as total,
-                        sum(case when direction_hat = actual_direction then 1 else 0 end) as correct,
-                        sum(case when touch_time_sec is not null then 1 else 0 end) as hits,
-                        avg(cast(error as double precision)) as avg_error
-                    FROM evaluation_results
-                    WHERE status = 'COMPLETED'
-                """),
-                conn,
+                params={"sym": settings.SYMBOL},
             )
     except Exception as e:
-        st.warning(f"evaluation_results table not available yet: {e}")
+        st.warning(f"evaluation_results not available: {e}")
         eval_recent = pd.DataFrame()
-        eval_stats = pd.DataFrame()
 
-    if eval_recent.empty:
-        st.info("No evaluation results yet. Evaluator starts after first horizon expires (H_SEC seconds).")
-    else:
-        if not eval_stats.empty and eval_stats.iloc[0]["total"] > 0:
-            es = eval_stats.iloc[0]
-            total = int(es["total"])
-            accuracy = int(es["correct"]) / total if total > 0 else 0
-            hit_rate = int(es["hits"]) / total if total > 0 else 0
-            avg_err = es["avg_error"] if pd.notna(es["avg_error"]) else 0
-
-            ec1, ec2, ec3, ec4 = st.columns(4)
-            ec1.metric("Total Evaluated", total)
-            ec2.metric("Accuracy", f"{accuracy:.1%}")
-            ec3.metric("Hit Rate", f"{hit_rate:.1%}")
-            ec4.metric("Avg Error", f"{avg_err:.6f}")
-
+    if not eval_recent.empty:
         st.dataframe(eval_recent, use_container_width=True, height=400)
+    else:
+        st.info("No evaluation results yet.")
 
 
 if __name__ == "__main__":

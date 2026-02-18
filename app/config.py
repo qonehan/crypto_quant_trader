@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     ENTER_PDIR_MARGIN: float = 0.05
     ENTER_SPREAD_BPS_MAX: float = 20.0
 
+    # Evaluator / Dashboard windows
+    EVAL_WINDOW_N: int = 500
+    DASH_PRED_WINDOW_N: int = 200
+
     MODE: str = "paper"
 
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"

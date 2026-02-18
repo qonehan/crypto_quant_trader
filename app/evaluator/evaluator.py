@@ -64,6 +64,37 @@ UPDATE predictions SET status = 'SETTLED' WHERE symbol = :symbol AND t0 = :t0
 """)
 
 
+def compute_calibration(rows, class_name: str, bins: int = 10) -> list[dict]:
+    """Compute one-vs-rest calibration for a given class (UP/DOWN/NONE)."""
+    p_key = {"UP": "p_up", "DOWN": "p_down", "NONE": "p_none"}[class_name]
+    result = []
+    for i in range(bins):
+        lo = i / bins
+        hi = (i + 1) / bins
+        subset = []
+        for r in rows:
+            p = getattr(r, p_key, None) if hasattr(r, p_key) else r.get(p_key)
+            if p is None:
+                continue
+            if lo <= p < hi or (i == bins - 1 and p == hi):
+                actual_dir = getattr(r, "actual_direction", None) if hasattr(r, "actual_direction") else r.get("actual_direction")
+                y = 1.0 if actual_dir == class_name else 0.0
+                subset.append((p, y))
+        if not subset:
+            result.append({"bin": f"{lo:.1f}-{hi:.1f}", "count": 0, "avg_p": 0.0, "actual_rate": 0.0, "abs_gap": 0.0})
+            continue
+        avg_p = sum(s[0] for s in subset) / len(subset)
+        actual_rate = sum(s[1] for s in subset) / len(subset)
+        result.append({
+            "bin": f"{lo:.1f}-{hi:.1f}",
+            "count": len(subset),
+            "avg_p": round(avg_p, 4),
+            "actual_rate": round(actual_rate, 4),
+            "abs_gap": round(abs(avg_p - actual_rate), 4),
+        })
+    return result
+
+
 class Evaluator:
     def __init__(self, settings: Settings, engine: Engine) -> None:
         self.settings = settings
@@ -278,16 +309,20 @@ class Evaluator:
         )
 
     def _compute_aggregate_metrics(self) -> dict | None:
-        """Compute aggregate accuracy/hit_rate from recent exec_v1 evaluations."""
+        """Compute aggregate metrics from recent exec_v1 evaluations."""
+        window_n = getattr(self.settings, "EVAL_WINDOW_N", 500)
         with self.engine.connect() as conn:
             rows = conn.execute(
                 text("""
                     SELECT direction_hat, actual_direction, touch_time_sec,
+                           p_up, p_down, p_none,
                            brier, logloss, ambig_touch
                     FROM evaluation_results
                     WHERE label_version = 'exec_v1'
-                    ORDER BY t0 DESC LIMIT 100
-                """)
+                      AND brier IS NOT NULL AND logloss IS NOT NULL
+                    ORDER BY t0 DESC LIMIT :n
+                """),
+                {"n": window_n},
             ).fetchall()
 
         if not rows:
@@ -297,18 +332,36 @@ class Evaluator:
         correct = sum(1 for r in rows if r.direction_hat == r.actual_direction)
         hits = sum(1 for r in rows if r.touch_time_sec is not None)
         ambig = sum(1 for r in rows if r.ambig_touch is True)
+        none_count = sum(1 for r in rows if r.actual_direction == "NONE")
+        up_count = sum(1 for r in rows if r.actual_direction == "UP")
+        down_count = sum(1 for r in rows if r.actual_direction == "DOWN")
         briers = [r.brier for r in rows if r.brier is not None]
         loglosses = [r.logloss for r in rows if r.logloss is not None]
         avg_brier = sum(briers) / len(briers) if briers else 0.0
         avg_logloss = sum(loglosses) / len(loglosses) if loglosses else 0.0
 
+        # Calibration ECE per class
+        calib_ece = {}
+        for cls in ("UP", "DOWN", "NONE"):
+            calib = compute_calibration(rows, cls)
+            weighted_gap = 0.0
+            total_count = 0
+            for b in calib:
+                weighted_gap += b["abs_gap"] * b["count"]
+                total_count += b["count"]
+            calib_ece[cls] = weighted_gap / total_count if total_count > 0 else 0.0
+
         return {
             "total": total,
             "accuracy": correct / total,
             "hit_rate": hits / total,
+            "none_rate": none_count / total,
+            "up_rate": up_count / total,
+            "down_rate": down_count / total,
             "ambig_count": ambig,
             "avg_brier": avg_brier,
             "avg_logloss": avg_logloss,
+            "calib_ece": calib_ece,
         }
 
     async def run(self) -> None:
@@ -327,15 +380,19 @@ class Evaluator:
                     metrics = await asyncio.to_thread(self._compute_aggregate_metrics)
                     if metrics:
                         log.info(
-                            "Eval(exec_v1): settled=%d total=%d acc=%.3f hit=%.3f "
-                            "ambig=%d brier=%.4f logloss=%.4f",
-                            settled,
+                            "EvalMetrics(exec_v1): N=%d acc=%.3f hit=%.3f "
+                            "none=%.3f brier=%.4f logloss=%.4f",
                             metrics["total"],
                             metrics["accuracy"],
                             metrics["hit_rate"],
-                            metrics["ambig_count"],
+                            metrics["none_rate"],
                             metrics["avg_brier"],
                             metrics["avg_logloss"],
+                        )
+                        ece = metrics.get("calib_ece", {})
+                        log.info(
+                            "CalibECE: UP=%.4f DOWN=%.4f NONE=%.4f",
+                            ece.get("UP", 0), ece.get("DOWN", 0), ece.get("NONE", 0),
                         )
                     else:
                         log.info("Eval(exec_v1): settled=%d predictions", settled)
