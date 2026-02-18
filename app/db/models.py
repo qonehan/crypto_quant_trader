@@ -217,3 +217,86 @@ class BarrierParams(Base):
 
     def __repr__(self) -> str:
         return f"<BarrierParams {self.symbol} k_vol_eff={self.k_vol_eff}>"
+
+
+class PaperPosition(Base):
+    __tablename__ = "paper_positions"
+
+    symbol = Column(Text, primary_key=True)
+    status = Column(Text, nullable=False)  # FLAT | LONG
+    cash_krw = Column(Double, nullable=False)
+    qty = Column(Double, nullable=False)
+    entry_time = Column(DateTime(timezone=True), nullable=True)
+    entry_price = Column(Double, nullable=True)
+    entry_fee_krw = Column(Double, nullable=True)
+    u_exec = Column(Double, nullable=True)
+    d_exec = Column(Double, nullable=True)
+    h_sec = Column(Integer, nullable=True)
+    entry_pred_t0 = Column(DateTime(timezone=True), nullable=True)
+    entry_model_version = Column(Text, nullable=True)
+    entry_r_t = Column(Double, nullable=True)
+    entry_z_barrier = Column(Double, nullable=True)
+    entry_ev_rate = Column(Double, nullable=True)
+    entry_p_none = Column(Double, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<PaperPosition {self.symbol} status={self.status} cash={self.cash_krw}>"
+
+
+class PaperTrade(Base):
+    __tablename__ = "paper_trades"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    t = Column(DateTime(timezone=True), nullable=False)
+    symbol = Column(Text, nullable=False)
+    action = Column(Text, nullable=False)
+    reason = Column(Text, nullable=False)
+    price = Column(Double, nullable=False)
+    qty = Column(Double, nullable=False)
+    fee_krw = Column(Double, nullable=False)
+    cash_after = Column(Double, nullable=False)
+    pnl_krw = Column(Double, nullable=True)
+    pnl_rate = Column(Double, nullable=True)
+    hold_sec = Column(Double, nullable=True)
+    pred_t0 = Column(DateTime(timezone=True), nullable=True)
+    model_version = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_paper_trades_symbol_t", "symbol", "t"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<PaperTrade {self.symbol} {self.t} {self.action} {self.reason}>"
+
+
+class PaperDecision(Base):
+    __tablename__ = "paper_decisions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    ts = Column(DateTime(timezone=True), nullable=False)
+    symbol = Column(Text, nullable=False)
+    pos_status = Column(Text, nullable=False)
+    action = Column(Text, nullable=False)
+    reason = Column(Text, nullable=False)
+    ev_rate = Column(Double, nullable=True)
+    ev = Column(Double, nullable=True)
+    p_up = Column(Double, nullable=True)
+    p_down = Column(Double, nullable=True)
+    p_none = Column(Double, nullable=True)
+    r_t = Column(Double, nullable=True)
+    z_barrier = Column(Double, nullable=True)
+    spread_bps = Column(Double, nullable=True)
+    lag_sec = Column(Double, nullable=True)
+    cost_roundtrip_est = Column(Double, nullable=True)
+    model_version = Column(Text, nullable=True)
+    pred_t0 = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_paper_decisions_symbol_ts", "symbol", "ts"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<PaperDecision {self.symbol} {self.ts} {self.action} {self.reason}>"

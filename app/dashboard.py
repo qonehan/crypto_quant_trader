@@ -343,6 +343,109 @@ def main() -> None:
     else:
         st.info("No evaluation results yet.")
 
+    # ══════════════════════════════════════════════════════════
+    # [E] Paper Trading
+    # ══════════════════════════════════════════════════════════
+    st.header("[E] Paper Trading")
+
+    try:
+        with engine.connect() as conn:
+            pp_df = pd.read_sql_query(
+                text(
+                    "SELECT symbol, status, cash_krw, qty, entry_time, entry_price, "
+                    "u_exec, d_exec, h_sec, entry_r_t, entry_ev_rate, entry_p_none, updated_at "
+                    "FROM paper_positions WHERE symbol = :sym"
+                ),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"paper_positions not available: {e}")
+        pp_df = pd.DataFrame()
+
+    if not pp_df.empty:
+        pp = pp_df.iloc[0]
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Status", pp["status"])
+        p1.metric("Cash (KRW)", f"{pp['cash_krw']:,.0f}")
+        p2.metric("Qty", f"{pp['qty']:.8f}")
+        p2.metric("Entry Price", f"{pp['entry_price']:,.0f}" if pd.notna(pp["entry_price"]) else "N/A")
+        p3.metric("u_exec", f"{pp['u_exec']:,.0f}" if pd.notna(pp["u_exec"]) else "N/A")
+        p3.metric("d_exec", f"{pp['d_exec']:,.0f}" if pd.notna(pp["d_exec"]) else "N/A")
+        p4.metric("entry_r_t", f"{pp['entry_r_t']:.6f}" if pd.notna(pp["entry_r_t"]) else "N/A")
+        st.caption(f"Updated at: {pp['updated_at']}")
+    else:
+        st.info("No paper position yet.")
+
+    # Paper Trades
+    st.subheader("Paper Trades — Recent 30")
+    try:
+        with engine.connect() as conn:
+            pt_df = pd.read_sql_query(
+                text(
+                    "SELECT t, action, reason, price, qty, fee_krw, cash_after, "
+                    "pnl_krw, pnl_rate, hold_sec, model_version "
+                    "FROM paper_trades WHERE symbol = :sym ORDER BY t DESC LIMIT 30"
+                ),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"paper_trades not available: {e}")
+        pt_df = pd.DataFrame()
+
+    if not pt_df.empty:
+        st.dataframe(pt_df, use_container_width=True, height=300)
+    else:
+        st.info("No paper trades yet (expected if cost > r_t).")
+
+    # Paper Decisions
+    st.subheader("Paper Decisions — Recent 60")
+    try:
+        with engine.connect() as conn:
+            pd_df = pd.read_sql_query(
+                text(
+                    "SELECT ts, pos_status, action, reason, ev_rate, p_none, "
+                    "spread_bps, lag_sec, cost_roundtrip_est, r_t "
+                    "FROM paper_decisions WHERE symbol = :sym ORDER BY ts DESC LIMIT 60"
+                ),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"paper_decisions not available: {e}")
+        pd_df = pd.DataFrame()
+
+    if not pd_df.empty:
+        st.dataframe(pd_df, use_container_width=True, height=400)
+
+    # Why no trades? — reason distribution
+    st.subheader("Why no trades? — Decision Reason Distribution (last 500)")
+    try:
+        with engine.connect() as conn:
+            reason_dist = pd.read_sql_query(
+                text("""
+                    SELECT reason, count(*) as cnt
+                    FROM (
+                        SELECT reason FROM paper_decisions
+                        WHERE symbol = :sym
+                        ORDER BY ts DESC LIMIT 500
+                    ) sub
+                    GROUP BY reason ORDER BY cnt DESC LIMIT 8
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"reason distribution not available: {e}")
+        reason_dist = pd.DataFrame()
+
+    if not reason_dist.empty:
+        st.dataframe(reason_dist, use_container_width=True)
+        st.bar_chart(reason_dist.set_index("reason")["cnt"])
+    else:
+        st.info("No decision data yet.")
+
 
 if __name__ == "__main__":
     main()

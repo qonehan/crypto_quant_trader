@@ -16,6 +16,7 @@ from app.marketdata.state import MarketState
 from app.marketdata.upbit_ws import UpbitWsClient
 from app.models.baseline_v1 import BaselineModelV1
 from app.predictor.runner import PredictionRunner
+from app.trading.runner import PaperTradingRunner
 
 DB_RESOLVE_HINT = (
     "DB host 'db'를 찾지 못했습니다. "
@@ -113,6 +114,7 @@ async def async_main() -> None:
     model = BaselineModelV1()
     pred_runner = PredictionRunner(settings, engine, model)
     evaluator = Evaluator(settings, engine)
+    paper_runner = PaperTradingRunner(settings, engine, state)
 
     async def sync_counters():
         while True:
@@ -130,6 +132,10 @@ async def async_main() -> None:
         asyncio.create_task(pred_runner.run(), name="predictor"),
         asyncio.create_task(evaluator.run(), name="evaluator"),
     ]
+
+    if settings.PAPER_TRADING_ENABLED:
+        tasks.append(asyncio.create_task(paper_runner.run(), name="paper_trading"))
+        log.info("Paper trading enabled")
 
     try:
         await asyncio.gather(*tasks)

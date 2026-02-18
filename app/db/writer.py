@@ -238,3 +238,74 @@ def update_barrier_params(
                 "last_eval_t0": last_eval_t0,
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Paper Trading CRUD
+# ---------------------------------------------------------------------------
+
+_SELECT_PAPER_POS = text("""
+SELECT symbol, status, cash_krw, qty, entry_time, entry_price, entry_fee_krw,
+       u_exec, d_exec, h_sec, entry_pred_t0, entry_model_version,
+       entry_r_t, entry_z_barrier, entry_ev_rate, entry_p_none, updated_at
+FROM paper_positions WHERE symbol = :symbol
+""")
+
+_INSERT_PAPER_POS = text("""
+INSERT INTO paper_positions (symbol, status, cash_krw, qty)
+VALUES (:symbol, 'FLAT', :cash_krw, 0)
+ON CONFLICT (symbol) DO NOTHING
+""")
+
+_UPDATE_PAPER_POS = text("""
+UPDATE paper_positions SET
+    status = :status, cash_krw = :cash_krw, qty = :qty,
+    entry_time = :entry_time, entry_price = :entry_price, entry_fee_krw = :entry_fee_krw,
+    u_exec = :u_exec, d_exec = :d_exec, h_sec = :h_sec,
+    entry_pred_t0 = :entry_pred_t0, entry_model_version = :entry_model_version,
+    entry_r_t = :entry_r_t, entry_z_barrier = :entry_z_barrier,
+    entry_ev_rate = :entry_ev_rate, entry_p_none = :entry_p_none,
+    updated_at = now()
+WHERE symbol = :symbol
+""")
+
+_INSERT_PAPER_TRADE = text("""
+INSERT INTO paper_trades (t, symbol, action, reason, price, qty, fee_krw, cash_after,
+                          pnl_krw, pnl_rate, hold_sec, pred_t0, model_version)
+VALUES (:t, :symbol, :action, :reason, :price, :qty, :fee_krw, :cash_after,
+        :pnl_krw, :pnl_rate, :hold_sec, :pred_t0, :model_version)
+""")
+
+_INSERT_PAPER_DECISION = text("""
+INSERT INTO paper_decisions (ts, symbol, pos_status, action, reason,
+                             ev_rate, ev, p_up, p_down, p_none, r_t, z_barrier,
+                             spread_bps, lag_sec, cost_roundtrip_est, model_version, pred_t0)
+VALUES (:ts, :symbol, :pos_status, :action, :reason,
+        :ev_rate, :ev, :p_up, :p_down, :p_none, :r_t, :z_barrier,
+        :spread_bps, :lag_sec, :cost_roundtrip_est, :model_version, :pred_t0)
+""")
+
+
+def get_or_create_paper_position(engine: Engine, symbol: str, initial_krw: float) -> dict:
+    with engine.begin() as conn:
+        row = conn.execute(_SELECT_PAPER_POS, {"symbol": symbol}).fetchone()
+        if row is not None:
+            return row._asdict()
+        conn.execute(_INSERT_PAPER_POS, {"symbol": symbol, "cash_krw": initial_krw})
+        row = conn.execute(_SELECT_PAPER_POS, {"symbol": symbol}).fetchone()
+        return row._asdict()
+
+
+def update_paper_position(engine: Engine, pos: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_UPDATE_PAPER_POS, pos)
+
+
+def insert_paper_trade(engine: Engine, trade: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_INSERT_PAPER_TRADE, trade)
+
+
+def insert_paper_decision(engine: Engine, decision: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_INSERT_PAPER_DECISION, decision)

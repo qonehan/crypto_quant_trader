@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     EVAL_WINDOW_N: int = 500
     DASH_PRED_WINDOW_N: int = 200
 
+    # Paper trading
+    PAPER_TRADING_ENABLED: bool = True
+    PAPER_INITIAL_KRW: float = 1_000_000
+    MAX_POSITION_FRAC: float = 0.20
+    MIN_ORDER_KRW: float = 5000
+    EXIT_EV_RATE_TH: float = -0.00002
+    DATA_LAG_SEC_MAX: float = 5.0
+    COST_RMIN_MULT: float = 1.10
+
     MODE: str = "paper"
 
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"

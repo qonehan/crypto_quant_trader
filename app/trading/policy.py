@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+
+def decide_action(
+    now_utc: datetime,
+    pos_row: dict,
+    pred_row: dict | None,
+    market_snapshot: dict,
+    settings,
+) -> tuple[str, str]:
+    """Return (action, reason) based on current position and prediction."""
+    pos_status = pos_row["status"]
+
+    if pos_status == "LONG":
+        return _decide_long(now_utc, pos_row, pred_row, market_snapshot, settings)
+    return _decide_flat(now_utc, pred_row, market_snapshot, settings)
+
+
+def _decide_flat(
+    now_utc: datetime,
+    pred_row: dict | None,
+    market_snapshot: dict,
+    settings,
+) -> tuple[str, str]:
+    lag_sec = market_snapshot.get("lag_sec", 999)
+    spread_bps = market_snapshot.get("spread_bps", 999)
+
+    # Data / market safety
+    if lag_sec > settings.DATA_LAG_SEC_MAX:
+        return "STAY_FLAT", "DATA_LAG"
+    if spread_bps > settings.ENTER_SPREAD_BPS_MAX:
+        return "STAY_FLAT", "SPREAD_WIDE"
+
+    # Signal filters
+    if pred_row is None:
+        return "STAY_FLAT", "NO_PRED"
+
+    ev_rate = pred_row.get("ev_rate")
+    if ev_rate is None or ev_rate < settings.ENTER_EV_RATE_TH:
+        return "STAY_FLAT", "EV_RATE_LOW"
+
+    p_none = pred_row.get("p_none", 1.0)
+    if p_none > settings.ENTER_PNONE_MAX:
+        return "STAY_FLAT", "PNONE_HIGH"
+
+    p_up = pred_row.get("p_up", 0)
+    p_down = pred_row.get("p_down", 0)
+    if p_up < p_down + settings.ENTER_PDIR_MARGIN:
+        return "STAY_FLAT", "PDIR_WEAK"
+
+    # Cost vs r_t
+    r_t = pred_row.get("r_t", 0)
+    cost_est = _compute_cost_est(spread_bps, settings)
+    if r_t <= settings.COST_RMIN_MULT * cost_est:
+        return "STAY_FLAT", "COST_GT_RT"
+
+    return "ENTER_LONG", "OK"
+
+
+def _decide_long(
+    now_utc: datetime,
+    pos_row: dict,
+    pred_row: dict | None,
+    market_snapshot: dict,
+    settings,
+) -> tuple[str, str]:
+    slip_rate = settings.SLIPPAGE_BPS / 10000.0
+    best_bid = market_snapshot.get("best_bid")
+    if best_bid is None or best_bid <= 0:
+        return "HOLD_LONG", "NO_BID"
+
+    exit_exec = best_bid * (1 - slip_rate)
+
+    u_exec = pos_row.get("u_exec")
+    d_exec = pos_row.get("d_exec")
+
+    # TP
+    if u_exec is not None and exit_exec >= u_exec:
+        return "EXIT_LONG", "TP"
+
+    # SL
+    if d_exec is not None and exit_exec <= d_exec:
+        return "EXIT_LONG", "SL"
+
+    # Time stop
+    entry_time = pos_row.get("entry_time")
+    h_sec = pos_row.get("h_sec", settings.H_SEC)
+    if entry_time is not None and h_sec is not None:
+        if now_utc >= entry_time + timedelta(seconds=h_sec):
+            return "EXIT_LONG", "TIME"
+
+    # EV_BAD
+    if pred_row is not None:
+        ev_rate = pred_row.get("ev_rate")
+        if ev_rate is not None and ev_rate <= settings.EXIT_EV_RATE_TH:
+            return "EXIT_LONG", "EV_BAD"
+
+    return "HOLD_LONG", "OK"
+
+
+def _compute_cost_est(spread_bps: float, settings) -> float:
+    fee_round = 2 * settings.FEE_RATE
+    slip_round = 2 * (settings.SLIPPAGE_BPS / 10000.0)
+    spread_round = spread_bps / 10000.0
+    return settings.EV_COST_MULT * (fee_round + slip_round + spread_round)
