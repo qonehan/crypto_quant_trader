@@ -14,7 +14,7 @@ from app.evaluator.evaluator import Evaluator
 from app.marketdata.resampler import MarketResampler
 from app.marketdata.state import MarketState
 from app.marketdata.upbit_ws import UpbitWsClient
-from app.models.baseline import BaselineModel
+from app.models.baseline_v1 import BaselineModelV1
 from app.predictor.runner import PredictionRunner
 
 DB_RESOLVE_HINT = (
@@ -110,7 +110,7 @@ async def async_main() -> None:
     client = UpbitWsClient(settings, queue)
     resampler = MarketResampler(state, engine)
     barrier = BarrierController(settings, engine)
-    model = BaselineModel()
+    model = BaselineModelV1()
     pred_runner = PredictionRunner(settings, engine, model)
     evaluator = Evaluator(settings, engine)
 

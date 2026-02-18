@@ -23,7 +23,7 @@ ORDER BY ts DESC LIMIT 1
 """)
 
 _FETCH_MARKET_WINDOW_SQL = text("""
-SELECT ts, mid, spread, imbalance_top5
+SELECT ts, mid, mid_close_1s, spread, spread_bps, imbalance_top5, imb_notional_top5
 FROM market_1s
 WHERE symbol = :symbol AND ts <= :t0 AND ts >= :since
 ORDER BY ts ASC
@@ -85,23 +85,33 @@ class PredictionRunner:
             "sigma_1s": barrier_row.get("sigma_1s"),
             "sigma_h": barrier_row.get("sigma_h"),
             "features": json.dumps(output.features),
+            # v1 fields
+            "z_barrier": output.z_barrier,
+            "p_hit_base": output.p_hit_base,
+            "ev_rate": output.ev_rate,
+            "r_none_pred": output.r_none_pred,
+            "t_up_cond_pred": output.t_up_cond_pred,
+            "t_down_cond_pred": output.t_down_cond_pred,
+            "spread_bps": output.spread_bps,
+            "mom_z": output.mom_z,
+            "imb_notional_top5": output.imb_notional_top5,
+            "action_hat": output.action_hat,
         }
 
         upsert_prediction(self.engine, row)
 
         log.info(
-            "Pred: t0=%s r_t=%.6f p_up=%.4f p_down=%.4f p_none=%.4f "
-            "t_up=%.1f t_down=%.1f slope=%.8f ev=%.8f hat=%s",
+            "Pred(v1): t0=%s r_t=%.6f z=%s p_none=%.4f p_up=%.4f p_down=%.4f "
+            "ev=%.8f ev_rate=%s action=%s",
             t0.strftime("%H:%M:%S"),
             row["r_t"],
+            f"{output.z_barrier:.3f}" if output.z_barrier is not None else "N/A",
+            output.p_none,
             output.p_up,
             output.p_down,
-            output.p_none,
-            output.t_up if output.t_up is not None else 0.0,
-            output.t_down if output.t_down is not None else 0.0,
-            output.slope_pred,
             output.ev,
-            output.direction_hat,
+            f"{output.ev_rate:.8f}" if output.ev_rate is not None else "N/A",
+            output.action_hat or "N/A",
         )
 
     async def run(self) -> None:

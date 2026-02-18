@@ -95,13 +95,19 @@ INSERT INTO predictions (
     p_up, p_down, p_none, t_up, t_down,
     slope_pred, ev, direction_hat,
     model_version, status,
-    sigma_1s, sigma_h, features
+    sigma_1s, sigma_h, features,
+    z_barrier, p_hit_base, ev_rate, r_none_pred,
+    t_up_cond_pred, t_down_cond_pred,
+    spread_bps, mom_z, imb_notional_top5, action_hat
 ) VALUES (
     :t0, :symbol, :h_sec, :r_t,
     :p_up, :p_down, :p_none, :t_up, :t_down,
     :slope_pred, :ev, :direction_hat,
     :model_version, :status,
-    :sigma_1s, :sigma_h, :features
+    :sigma_1s, :sigma_h, :features,
+    :z_barrier, :p_hit_base, :ev_rate, :r_none_pred,
+    :t_up_cond_pred, :t_down_cond_pred,
+    :spread_bps, :mom_z, :imb_notional_top5, :action_hat
 )
 ON CONFLICT ON CONSTRAINT uq_predictions_symbol_t0 DO UPDATE SET
     h_sec = EXCLUDED.h_sec,
@@ -118,7 +124,17 @@ ON CONFLICT ON CONSTRAINT uq_predictions_symbol_t0 DO UPDATE SET
     status = EXCLUDED.status,
     sigma_1s = EXCLUDED.sigma_1s,
     sigma_h = EXCLUDED.sigma_h,
-    features = EXCLUDED.features
+    features = EXCLUDED.features,
+    z_barrier = EXCLUDED.z_barrier,
+    p_hit_base = EXCLUDED.p_hit_base,
+    ev_rate = EXCLUDED.ev_rate,
+    r_none_pred = EXCLUDED.r_none_pred,
+    t_up_cond_pred = EXCLUDED.t_up_cond_pred,
+    t_down_cond_pred = EXCLUDED.t_down_cond_pred,
+    spread_bps = EXCLUDED.spread_bps,
+    mom_z = EXCLUDED.mom_z,
+    imb_notional_top5 = EXCLUDED.imb_notional_top5,
+    action_hat = EXCLUDED.action_hat
 """)
 
 

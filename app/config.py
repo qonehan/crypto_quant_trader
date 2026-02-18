@@ -35,6 +35,20 @@ class Settings(BaseSettings):
     EV_COST_MULT: float = 1.0
     P_NONE_MAX_FOR_SIGNAL: float = 0.7
 
+    # p_none(z) function parameter
+    P_HIT_CZ: float = 0.25
+
+    # score coefficients (standardized inputs)
+    SCORE_A_MOMZ: float = 1.5
+    SCORE_B_IMB: float = 1.0
+    SCORE_C_SPREAD: float = 1.0
+
+    # action_hat thresholds
+    ENTER_EV_RATE_TH: float = 0.0
+    ENTER_PNONE_MAX: float = 0.70
+    ENTER_PDIR_MARGIN: float = 0.05
+    ENTER_SPREAD_BPS_MAX: float = 20.0
+
     MODE: str = "paper"
 
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
