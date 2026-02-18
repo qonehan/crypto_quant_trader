@@ -2,6 +2,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Date,
     DateTime,
     Double,
     Index,
@@ -243,6 +244,16 @@ class PaperPosition(Base):
     entry_z_barrier = Column(Double, nullable=True)
     entry_ev_rate = Column(Double, nullable=True)
     entry_p_none = Column(Double, nullable=True)
+
+    # v1.2: risk management + equity tracking
+    initial_krw = Column(Double, nullable=True)
+    equity_high = Column(Double, nullable=True)
+    day_start_date = Column(Date, nullable=True)
+    day_start_equity = Column(Double, nullable=True)
+    halted = Column(Boolean, nullable=True)
+    halt_reason = Column(Text, nullable=True)
+    halted_at = Column(DateTime(timezone=True), nullable=True)
+
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:
@@ -298,6 +309,14 @@ class PaperDecision(Base):
     model_version = Column(Text, nullable=True)
     pred_t0 = Column(DateTime(timezone=True), nullable=True)
     reason_flags = Column(Text, nullable=True)
+
+    # v1.2: equity tracking
+    cash_krw = Column(Double, nullable=True)
+    qty = Column(Double, nullable=True)
+    equity_est = Column(Double, nullable=True)
+    drawdown_pct = Column(Double, nullable=True)
+    policy_profile = Column(Text, nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (

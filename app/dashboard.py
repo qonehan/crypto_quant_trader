@@ -365,7 +365,9 @@ def main() -> None:
             pp_df = pd.read_sql_query(
                 text(
                     "SELECT symbol, status, cash_krw, qty, entry_time, entry_price, "
-                    "u_exec, d_exec, h_sec, entry_r_t, entry_ev_rate, entry_p_none, updated_at "
+                    "u_exec, d_exec, h_sec, entry_r_t, entry_ev_rate, entry_p_none, "
+                    "initial_krw, equity_high, day_start_date, day_start_equity, "
+                    "halted, halt_reason, halted_at, updated_at "
                     "FROM paper_positions WHERE symbol = :sym"
                 ),
                 conn,
@@ -377,17 +379,102 @@ def main() -> None:
 
     if not pp_df.empty:
         pp = pp_df.iloc[0]
-        p1, p2, p3, p4 = st.columns(4)
+        p1, p2, p3, p4, p5 = st.columns(5)
         p1.metric("Status", pp["status"])
         p1.metric("Cash (KRW)", f"{pp['cash_krw']:,.0f}")
         p2.metric("Qty", f"{pp['qty']:.8f}")
         p2.metric("Entry Price", f"{pp['entry_price']:,.0f}" if pd.notna(pp["entry_price"]) else "N/A")
-        p3.metric("u_exec", f"{pp['u_exec']:,.0f}" if pd.notna(pp["u_exec"]) else "N/A")
-        p3.metric("d_exec", f"{pp['d_exec']:,.0f}" if pd.notna(pp["d_exec"]) else "N/A")
-        p4.metric("entry_r_t", f"{pp['entry_r_t']:.6f}" if pd.notna(pp["entry_r_t"]) else "N/A")
+        p3.metric("equity_high", f"{pp['equity_high']:,.0f}" if pd.notna(pp.get("equity_high")) else "N/A")
+        p3.metric("initial_krw", f"{pp['initial_krw']:,.0f}" if pd.notna(pp.get("initial_krw")) else "N/A")
+        halted_val = pp.get("halted")
+        p4.metric("Halted", str(halted_val) if halted_val is not None else "false")
+        p4.metric("Halt Reason", pp.get("halt_reason") or "N/A")
+        p5.metric("entry_r_t", f"{pp['entry_r_t']:.6f}" if pd.notna(pp["entry_r_t"]) else "N/A")
+        p5.metric("Profile", getattr(settings, "PAPER_POLICY_PROFILE", "strict"))
         st.caption(f"Updated at: {pp['updated_at']}")
     else:
         st.info("No paper position yet.")
+
+    # Equity Curve + Drawdown
+    st.subheader("Equity Curve — Last 6h")
+    try:
+        with engine.connect() as conn:
+            eq_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, equity_est, drawdown_pct, policy_profile
+                    FROM paper_decisions
+                    WHERE symbol = :sym AND equity_est IS NOT NULL
+                      AND ts >= now() - interval '6 hours'
+                    ORDER BY ts ASC
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"equity data not available: {e}")
+        eq_df = pd.DataFrame()
+
+    if not eq_df.empty:
+        eq_chart = eq_df.set_index("ts")
+        st.line_chart(eq_chart["equity_est"])
+        st.subheader("Drawdown (%) — Last 6h")
+        st.line_chart(eq_chart["drawdown_pct"] * 100)
+    else:
+        st.info("No equity data yet.")
+
+    # Trade Stats
+    st.subheader("Trade Stats (EXIT_LONG, last 200)")
+    try:
+        with engine.connect() as conn:
+            exit_stats = pd.read_sql_query(
+                text("""
+                    SELECT count(*) as trades,
+                           avg(case when pnl_krw > 0 then 1.0 else 0.0 end) as win_rate,
+                           avg(pnl_krw) as avg_pnl_krw,
+                           avg(pnl_rate) as avg_pnl_rate,
+                           avg(hold_sec) as avg_hold_sec,
+                           sum(fee_krw) as total_fee_krw
+                    FROM (
+                        SELECT * FROM paper_trades
+                        WHERE symbol = :sym AND action = 'EXIT_LONG'
+                        ORDER BY t DESC LIMIT 200
+                    ) sub
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+            exit_reasons = pd.read_sql_query(
+                text("""
+                    SELECT reason, count(*) as cnt
+                    FROM (
+                        SELECT reason FROM paper_trades
+                        WHERE symbol = :sym AND action = 'EXIT_LONG'
+                        ORDER BY t DESC LIMIT 200
+                    ) sub
+                    GROUP BY reason ORDER BY cnt DESC
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"trade stats not available: {e}")
+        exit_stats = pd.DataFrame()
+        exit_reasons = pd.DataFrame()
+
+    if not exit_stats.empty and exit_stats.iloc[0]["trades"] > 0:
+        es = exit_stats.iloc[0]
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Trades", int(es["trades"]))
+        s2.metric("Win Rate", f"{es['win_rate']:.2%}")
+        s3.metric("Avg PnL (KRW)", f"{es['avg_pnl_krw']:,.0f}")
+        s4.metric("Avg Hold (sec)", f"{es['avg_hold_sec']:.0f}" if pd.notna(es["avg_hold_sec"]) else "N/A")
+        s5.metric("Total Fees (KRW)", f"{es['total_fee_krw']:,.0f}")
+
+        if not exit_reasons.empty:
+            st.caption("Exit Reason Distribution:")
+            st.dataframe(exit_reasons, use_container_width=True)
+    else:
+        st.info("No EXIT_LONG trades yet.")
 
     # Paper Trades
     st.subheader("Paper Trades — Recent 30")
@@ -418,7 +505,8 @@ def main() -> None:
             pd_df = pd.read_sql_query(
                 text(
                     "SELECT ts, pos_status, action, reason, reason_flags, ev_rate, p_none, "
-                    "spread_bps, lag_sec, cost_roundtrip_est, r_t "
+                    "spread_bps, lag_sec, cost_roundtrip_est, r_t, "
+                    "equity_est, drawdown_pct, policy_profile "
                     "FROM paper_decisions WHERE symbol = :sym ORDER BY ts DESC LIMIT 60"
                 ),
                 conn,

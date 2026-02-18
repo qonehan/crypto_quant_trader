@@ -252,13 +252,19 @@ def update_barrier_params(
 _SELECT_PAPER_POS = text("""
 SELECT symbol, status, cash_krw, qty, entry_time, entry_price, entry_fee_krw,
        u_exec, d_exec, h_sec, entry_pred_t0, entry_model_version,
-       entry_r_t, entry_z_barrier, entry_ev_rate, entry_p_none, updated_at
+       entry_r_t, entry_z_barrier, entry_ev_rate, entry_p_none,
+       initial_krw, equity_high, day_start_date, day_start_equity,
+       halted, halt_reason, halted_at, updated_at
 FROM paper_positions WHERE symbol = :symbol
 """)
 
 _INSERT_PAPER_POS = text("""
-INSERT INTO paper_positions (symbol, status, cash_krw, qty)
-VALUES (:symbol, 'FLAT', :cash_krw, 0)
+INSERT INTO paper_positions (symbol, status, cash_krw, qty,
+                             initial_krw, equity_high, day_start_date, day_start_equity,
+                             halted)
+VALUES (:symbol, 'FLAT', :cash_krw, 0,
+        :initial_krw, :equity_high, :day_start_date, :day_start_equity,
+        false)
 ON CONFLICT (symbol) DO NOTHING
 """)
 
@@ -270,6 +276,9 @@ UPDATE paper_positions SET
     entry_pred_t0 = :entry_pred_t0, entry_model_version = :entry_model_version,
     entry_r_t = :entry_r_t, entry_z_barrier = :entry_z_barrier,
     entry_ev_rate = :entry_ev_rate, entry_p_none = :entry_p_none,
+    initial_krw = :initial_krw, equity_high = :equity_high,
+    day_start_date = :day_start_date, day_start_equity = :day_start_equity,
+    halted = :halted, halt_reason = :halt_reason, halted_at = :halted_at,
     updated_at = now()
 WHERE symbol = :symbol
 """)
@@ -285,20 +294,46 @@ _INSERT_PAPER_DECISION = text("""
 INSERT INTO paper_decisions (ts, symbol, pos_status, action, reason,
                              ev_rate, ev, p_up, p_down, p_none, r_t, z_barrier,
                              spread_bps, lag_sec, cost_roundtrip_est, model_version, pred_t0,
-                             reason_flags)
+                             reason_flags,
+                             cash_krw, qty, equity_est, drawdown_pct, policy_profile)
 VALUES (:ts, :symbol, :pos_status, :action, :reason,
         :ev_rate, :ev, :p_up, :p_down, :p_none, :r_t, :z_barrier,
         :spread_bps, :lag_sec, :cost_roundtrip_est, :model_version, :pred_t0,
-        :reason_flags)
+        :reason_flags,
+        :cash_krw, :qty, :equity_est, :drawdown_pct, :policy_profile)
 """)
 
 
 def get_or_create_paper_position(engine: Engine, symbol: str, initial_krw: float) -> dict:
+    from datetime import date, timezone, datetime as dt
+    today_utc = dt.now(timezone.utc).date()
     with engine.begin() as conn:
         row = conn.execute(_SELECT_PAPER_POS, {"symbol": symbol}).fetchone()
         if row is not None:
-            return row._asdict()
-        conn.execute(_INSERT_PAPER_POS, {"symbol": symbol, "cash_krw": initial_krw})
+            d = row._asdict()
+            # Backfill missing fields for existing rows
+            if d.get("initial_krw") is None:
+                conn.execute(text(
+                    "UPDATE paper_positions SET initial_krw=:v, equity_high=:v, "
+                    "day_start_date=:d, day_start_equity=:v, halted=false "
+                    "WHERE symbol=:s AND initial_krw IS NULL"
+                ), {"v": initial_krw, "d": today_utc, "s": symbol})
+                d["initial_krw"] = initial_krw
+                d["equity_high"] = initial_krw
+                d["day_start_date"] = today_utc
+                d["day_start_equity"] = initial_krw
+                d["halted"] = False
+                d["halt_reason"] = None
+                d["halted_at"] = None
+            return d
+        conn.execute(_INSERT_PAPER_POS, {
+            "symbol": symbol,
+            "cash_krw": initial_krw,
+            "initial_krw": initial_krw,
+            "equity_high": initial_krw,
+            "day_start_date": today_utc,
+            "day_start_equity": initial_krw,
+        })
         row = conn.execute(_SELECT_PAPER_POS, {"symbol": symbol}).fetchone()
         return row._asdict()
 

@@ -93,10 +93,29 @@ CREATE TABLE IF NOT EXISTS barrier_params (
 
 
 # ---------------------------------------------------------------------------
-# (6) paper_decisions: multi-flag reason
+# (6) paper_decisions: multi-flag reason + equity tracking
 # ---------------------------------------------------------------------------
 _MIG_PAPER_DECISIONS = [
     "reason_flags TEXT",
+    # v1.2: equity tracking
+    "cash_krw DOUBLE PRECISION",
+    "qty DOUBLE PRECISION",
+    "equity_est DOUBLE PRECISION",
+    "drawdown_pct DOUBLE PRECISION",
+    "policy_profile TEXT",
+]
+
+# ---------------------------------------------------------------------------
+# (7) paper_positions: risk management + equity tracking
+# ---------------------------------------------------------------------------
+_MIG_PAPER_POSITIONS = [
+    "initial_krw DOUBLE PRECISION",
+    "equity_high DOUBLE PRECISION",
+    "day_start_date DATE",
+    "day_start_equity DOUBLE PRECISION",
+    "halted BOOLEAN",
+    "halt_reason TEXT",
+    "halted_at TIMESTAMPTZ",
 ]
 
 
@@ -130,7 +149,10 @@ def apply_migrations(engine: Engine) -> None:
         conn.execute(_CREATE_BARRIER_PARAMS)
         log.info("Applied: barrier_params table (CREATE IF NOT EXISTS)")
 
-        # (6) paper_decisions multi-flag
-        _add_columns(conn, "paper_decisions", _MIG_PAPER_DECISIONS, "paper_decisions reason_flags")
+        # (6) paper_decisions multi-flag + equity
+        _add_columns(conn, "paper_decisions", _MIG_PAPER_DECISIONS, "paper_decisions equity+flags")
+
+        # (7) paper_positions risk management
+        _add_columns(conn, "paper_positions", _MIG_PAPER_POSITIONS, "paper_positions risk mgmt")
 
     log.info("All v1 migrations complete")

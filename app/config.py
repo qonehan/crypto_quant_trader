@@ -66,6 +66,24 @@ class Settings(BaseSettings):
     DATA_LAG_SEC_MAX: float = 5.0
     COST_RMIN_MULT: float = 1.10
 
+    # Risk stops
+    PAPER_MAX_DRAWDOWN_PCT: float = 0.05
+    PAPER_DAILY_LOSS_LIMIT_PCT: float = 0.03
+    PAPER_HALT_COOLDOWN_MIN: int = 1440
+
+    # Equity logging
+    PAPER_EQUITY_LOG_ENABLED: bool = True
+
+    # Policy profile: strict | test
+    PAPER_POLICY_PROFILE: str = "strict"
+    TEST_ENTER_EV_RATE_TH: float = -0.00003
+    TEST_ENTER_PNONE_MAX: float = 0.99
+    TEST_ENTER_PDIR_MARGIN: float = -1.0
+    TEST_COST_RMIN_MULT: float = 0.95
+    TEST_MAX_POSITION_FRAC: float = 0.05
+    TEST_MAX_ENTRIES_PER_HOUR: int = 2
+    TEST_COOLDOWN_SEC: int = 300
+
     MODE: str = "paper"
 
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
