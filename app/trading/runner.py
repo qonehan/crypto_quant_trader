@@ -135,8 +135,10 @@ class PaperTradingRunner:
                 self._save_pos_with_risk_fields(new_pos, pos)
                 insert_paper_trade(self.engine, trade)
                 log.info(
-                    "Paper ENTER: price=%.0f qty=%.8f fee=%.2f cash=%.0f",
+                    "PaperTrade ENTER: price=%.0f qty=%.8f fee=%.2f cash=%.0f u_exec=%.0f d_exec=%.0f h=%ds",
                     trade["price"], trade["qty"], trade["fee_krw"], trade["cash_after"],
+                    new_pos.get("u_exec") or 0, new_pos.get("d_exec") or 0,
+                    new_pos.get("h_sec") or 0,
                 )
                 # Re-read pos after update for equity calc
                 pos = get_or_create_paper_position(
@@ -152,8 +154,8 @@ class PaperTradingRunner:
             self._save_pos_with_risk_fields(new_pos, pos)
             insert_paper_trade(self.engine, trade)
             log.info(
-                "Paper EXIT(%s): price=%.0f pnl=%.2f pnl_rate=%.4f%% hold=%.0fs cash=%.0f",
-                reason, trade["price"],
+                "PaperTrade EXIT(%s): price=%.0f qty=%.8f fee=%.2f pnl=%.2f pnl_rate=%.4f%% hold=%.0fs cash=%.0f",
+                reason, trade["price"], trade["qty"], trade["fee_krw"],
                 trade["pnl_krw"] or 0, (trade["pnl_rate"] or 0) * 100,
                 trade["hold_sec"] or 0, trade["cash_after"],
             )

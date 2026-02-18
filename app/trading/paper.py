@@ -25,6 +25,10 @@ def execute_enter_long(
     entry_fee = entry_cost * settings.FEE_RATE
     cash_after = cash_krw - entry_cost - entry_fee
 
+    # Sanity check: cancel entry if cash goes negative
+    if cash_after < 0:
+        return None
+
     r_t = pred_row.get("r_t", settings.R_MIN)
     h_sec = pred_row.get("h_sec", settings.H_SEC)
 
