@@ -1,3 +1,11 @@
+import os
+import sys
+
+# sys.path 보정: 어떤 경로에서 실행해도 프로젝트 루트를 찾을 수 있게 한다.
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import json
 
 import streamlit as st
