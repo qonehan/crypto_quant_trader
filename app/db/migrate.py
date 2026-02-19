@@ -320,4 +320,83 @@ def apply_migrations(engine: Engine) -> None:
         """))
         log.info("Applied: upbit_order_attempts.blocked_reasons JSONB (Step 11)")
 
-    log.info("All migrations complete (v1 + Step 7 + Step 8 + Step 9 + Step 11)")
+        # ── Step ALT: Alt Data tables ────────────────────────────────────
+        # (ALT-1) binance_mark_price_1s
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS binance_mark_price_1s (
+                id              BIGSERIAL PRIMARY KEY,
+                ts              TIMESTAMPTZ NOT NULL,
+                symbol          TEXT NOT NULL,
+                mark_price      DOUBLE PRECISION,
+                index_price     DOUBLE PRECISION,
+                funding_rate    DOUBLE PRECISION,
+                next_funding_time TIMESTAMPTZ,
+                raw_json        JSONB NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_binance_mark_price_symbol_ts
+            ON binance_mark_price_1s (symbol, ts DESC)
+        """))
+        log.info("Applied: binance_mark_price_1s (CREATE IF NOT EXISTS)")
+
+        # (ALT-2) binance_force_orders
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS binance_force_orders (
+                id          BIGSERIAL PRIMARY KEY,
+                ts          TIMESTAMPTZ NOT NULL,
+                symbol      TEXT NOT NULL,
+                side        TEXT,
+                price       DOUBLE PRECISION,
+                qty         DOUBLE PRECISION,
+                notional    DOUBLE PRECISION,
+                order_type  TEXT,
+                raw_json    JSONB NOT NULL,
+                UNIQUE (symbol, ts, side, price, qty)
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_binance_force_orders_symbol_ts
+            ON binance_force_orders (symbol, ts DESC)
+        """))
+        log.info("Applied: binance_force_orders (CREATE IF NOT EXISTS)")
+
+        # (ALT-3) binance_futures_metrics
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS binance_futures_metrics (
+                id          BIGSERIAL PRIMARY KEY,
+                ts          TIMESTAMPTZ NOT NULL,
+                symbol      TEXT NOT NULL,
+                metric      TEXT NOT NULL,
+                value       DOUBLE PRECISION,
+                value2      DOUBLE PRECISION,
+                period      TEXT,
+                raw_json    JSONB NOT NULL,
+                UNIQUE (metric, symbol, ts, period)
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_binance_futures_metrics_metric_symbol_ts
+            ON binance_futures_metrics (metric, symbol, ts DESC)
+        """))
+        log.info("Applied: binance_futures_metrics (CREATE IF NOT EXISTS)")
+
+        # (ALT-4) coinglass_liquidation_map
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS coinglass_liquidation_map (
+                id           BIGSERIAL PRIMARY KEY,
+                ts           TIMESTAMPTZ NOT NULL,
+                symbol       TEXT NOT NULL,
+                exchange     TEXT,
+                timeframe    TEXT,
+                summary_json JSONB,
+                raw_json     JSONB NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_coinglass_liq_map_symbol_ts
+            ON coinglass_liquidation_map (symbol, ts DESC)
+        """))
+        log.info("Applied: coinglass_liquidation_map (CREATE IF NOT EXISTS)")
+
+    log.info("All migrations complete (v1 + Step 7-11 + Step ALT)")

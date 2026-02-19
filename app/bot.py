@@ -16,6 +16,7 @@ from app.marketdata.state import MarketState
 from app.marketdata.upbit_ws import UpbitWsClient
 from app.models.baseline_v1 import BaselineModelV1
 from app.predictor.runner import PredictionRunner
+from app.altdata.runner import BinanceAltDataRunner, CoinglassAltDataRunner
 from app.exchange.runner import ShadowExecutionRunner, UpbitAccountRunner
 from app.trading.runner import PaperTradingRunner
 
@@ -137,6 +138,19 @@ async def async_main() -> None:
     if settings.PAPER_TRADING_ENABLED:
         tasks.append(asyncio.create_task(paper_runner.run(), name="paper_trading"))
         log.info("Paper trading enabled")
+
+    if settings.ALT_DATA_ENABLED:
+        binance_runner = BinanceAltDataRunner(settings, engine)
+        tasks.append(asyncio.create_task(binance_runner.run(), name="binance_alt_data"))
+        log.info("BinanceAltDataRunner enabled (symbol=%s)", settings.ALT_SYMBOL_BINANCE)
+
+        coinglass_runner = CoinglassAltDataRunner(settings, engine)
+        tasks.append(asyncio.create_task(coinglass_runner.run(), name="coinglass_alt_data"))
+        log.info(
+            "CoinglassAltDataRunner enabled (key_set=%s poll_sec=%d)",
+            bool(settings.COINGLASS_API_KEY),
+            settings.COINGLASS_POLL_SEC,
+        )
 
     if settings.UPBIT_SHADOW_ENABLED:
         shadow_runner = ShadowExecutionRunner(settings, engine)

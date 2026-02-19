@@ -915,6 +915,138 @@ def main() -> None:
     else:
         st.info("주문 스냅샷 없음 (live 모드에서 실주문 시 uuid 폴링으로 자동 생성)")
 
+    # ══════════════════════════════════════════════════════════
+    # [G] Alt Data (Binance / Coinglass)
+    # ══════════════════════════════════════════════════════════
+    st.header("[G] Alt Data (Binance Futures / Coinglass)")
+
+    alt_sym = settings.ALT_SYMBOL_BINANCE
+    cg_sym = settings.ALT_SYMBOL_COINGLASS
+    poll_sec = settings.BINANCE_POLL_SEC
+
+    # ── G1: Binance WS Health ─────────────────────────────────
+    st.subheader("G1 — Binance WS Health (mark price)")
+    try:
+        with engine.connect() as conn:
+            mp_row = conn.execute(
+                text("""
+                    SELECT max(ts) as last_ts,
+                           count(*) FILTER (
+                               WHERE ts >= now() AT TIME ZONE 'UTC' - interval '300 seconds'
+                           ) as cnt_5m
+                    FROM binance_mark_price_1s
+                    WHERE symbol = :sym
+                """),
+                {"sym": alt_sym},
+            ).fetchone()
+    except Exception as e:
+        st.warning(f"binance_mark_price_1s not available: {e}")
+        mp_row = None
+
+    if mp_row is not None:
+        last_ts_mp = mp_row.last_ts
+        cnt_5m = mp_row.cnt_5m or 0
+        fill_5m = cnt_5m / 300 if cnt_5m is not None else 0
+        if last_ts_mp is not None:
+            if last_ts_mp.tzinfo is None:
+                last_ts_mp = last_ts_mp.replace(tzinfo=__import__("datetime").timezone.utc)
+            lag_mp = (now_utc - last_ts_mp).total_seconds()
+        else:
+            lag_mp = None
+
+        g1c1, g1c2, g1c3 = st.columns(3)
+        g1c1.metric("Last Insert", str(last_ts_mp)[:19] if last_ts_mp else "N/A")
+        g1c2.metric("Lag (sec)", f"{lag_mp:.1f}" if lag_mp is not None else "N/A")
+        g1c3.metric("Fill Rate 5min", f"{fill_5m*100:.1f}% ({cnt_5m}/300)")
+    else:
+        st.info("mark price 데이터 없음 (bot 실행 후 대기)")
+
+    # ── G1b: Force Orders ─────────────────────────────────────
+    st.subheader("G1b — Binance Force Orders (24h)")
+    try:
+        with engine.connect() as conn:
+            fo_cnt = conn.execute(
+                text("""
+                    SELECT count(*) FROM binance_force_orders
+                    WHERE symbol=:sym
+                      AND ts >= now() AT TIME ZONE 'UTC' - interval '86400 seconds'
+                """),
+                {"sym": alt_sym},
+            ).scalar() or 0
+    except Exception:
+        fo_cnt = 0
+    st.metric("Liquidation Events (24h)", fo_cnt)
+    st.caption("이벤트 0건도 정상 — 청산이 없을 수 있음. WS 연결 상태 기준.")
+
+    # ── G2: Binance Futures Metrics ───────────────────────────
+    st.subheader("G2 — Binance Futures Metrics (최근 6h)")
+    try:
+        with engine.connect() as conn:
+            bfm_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, metric, value, value2, period
+                    FROM binance_futures_metrics
+                    WHERE symbol=:sym
+                      AND ts >= now() AT TIME ZONE 'UTC' - interval '21600 seconds'
+                    ORDER BY ts DESC LIMIT 200
+                """),
+                conn,
+                params={"sym": alt_sym},
+            )
+    except Exception as e:
+        st.warning(f"binance_futures_metrics not available: {e}")
+        bfm_df = pd.DataFrame()
+
+    if not bfm_df.empty:
+        metrics_to_show = ["open_interest", "global_ls_ratio", "taker_ls_ratio", "basis"]
+        for m in metrics_to_show:
+            sub = bfm_df[bfm_df["metric"] == m].sort_values("ts")
+            if sub.empty:
+                st.caption(f"{m}: no data")
+                continue
+            latest = sub.iloc[-1]
+            lag_m = (now_utc - pd.to_datetime(latest["ts"], utc=True)).total_seconds()
+            st.metric(
+                m,
+                f"{latest['value']:.6g}" if pd.notna(latest["value"]) else "N/A",
+                delta=f"lag={lag_m:.0f}s",
+            )
+        st.dataframe(bfm_df, use_container_width=True, height=250)
+    else:
+        st.info(f"Binance metrics 없음 (poll 주기={poll_sec}s, 첫 데이터 대기 중)")
+
+    # ── G3: Coinglass ─────────────────────────────────────────
+    st.subheader("G3 — Coinglass Liquidation Map")
+    cg_key_set = bool(settings.COINGLASS_API_KEY)
+    st.caption(f"COINGLASS_API_KEY: {'✅ 설정됨' if cg_key_set else '❌ 미설정 (수집 SKIP)'}")
+    try:
+        with engine.connect() as conn:
+            cg_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, symbol, exchange, timeframe, summary_json
+                    FROM coinglass_liquidation_map
+                    WHERE symbol=:sym
+                    ORDER BY ts DESC LIMIT 5
+                """),
+                conn,
+                params={"sym": cg_sym},
+            )
+    except Exception as e:
+        st.warning(f"coinglass_liquidation_map not available: {e}")
+        cg_df = pd.DataFrame()
+
+    if not cg_df.empty:
+        cg_last = cg_df.iloc[0]
+        cg_ts = pd.to_datetime(cg_last["ts"], utc=True)
+        cg_lag = (now_utc - cg_ts).total_seconds()
+        st.metric("Last Poll", str(cg_ts)[:19], delta=f"lag={cg_lag:.0f}s")
+        st.dataframe(cg_df, use_container_width=True, height=200)
+    else:
+        if cg_key_set:
+            st.info("Coinglass 데이터 없음 (첫 poll 대기)")
+        else:
+            st.info("COINGLASS_API_KEY 미설정 — 수집을 원하면 .env에 키를 추가하세요.")
+
 
 if __name__ == "__main__":
     main()

@@ -117,6 +117,24 @@ class Settings(BaseSettings):
 
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
 
+    # ── Alt Data (Binance / Coinglass) ─────────────────────────────
+    ALT_DATA_ENABLED: bool = True
+    ALT_SYMBOL_BINANCE: str = "BTCUSDT"
+    ALT_SYMBOL_COINGLASS: str = "BTC"
+
+    # Binance Futures WS
+    BINANCE_FUTURES_WS_BASE: str = "wss://fstream.binance.com/ws"
+    BINANCE_FUTURES_REST_BASE: str = "https://fapi.binance.com"
+    BINANCE_MARK_PRICE_STREAM: str = "!markPrice@arr@1s"
+    BINANCE_FORCE_ORDER_STREAM: str = "!forceOrder@arr"
+    BINANCE_POLL_SEC: int = 60
+    BINANCE_METRIC_PERIOD: str = "5m"
+
+    # Coinglass
+    COINGLASS_API_KEY: str = ""
+    COINGLASS_BASE: str = "https://open-api.coinglass.com"
+    COINGLASS_POLL_SEC: int = 300
+
 
 def load_settings() -> Settings:
     return Settings()
