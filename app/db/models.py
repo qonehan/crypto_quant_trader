@@ -378,6 +378,8 @@ class UpbitOrderAttempt(Base):
     executed_volume = Column(Double, nullable=True)
     paid_fee = Column(Double, nullable=True)
     avg_price = Column(Double, nullable=True)
+    # Step 11: blocked_reasons — why API call was skipped
+    blocked_reasons = Column(JSONB, nullable=True)
 
     __table_args__ = (
         Index("ix_upbit_order_attempts_ts", "ts"),

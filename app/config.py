@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     UPBIT_E2E_TEST_ORDER_KRW: int = 10000   # BUY order_test KRW amount
     UPBIT_E2E_TEST_SELL_BTC: float = 0.0001  # SELL order_test BTC volume (skip if balance insufficient)
 
+    # Step 11: paper_trades → Upbit TEST auto-link
+    UPBIT_TEST_ON_PAPER_TRADES: bool = True        # auto-call order_test on each paper_trade event
+    UPBIT_TEST_BUY_KRW: int = 10000                # BUY order_test price (KRW)
+    UPBIT_TEST_SELL_BTC: float = 0.0001            # SELL order_test volume fallback (BTC)
+    UPBIT_TEST_REQUIRE_PAPER_PROFILE: str = "test" # must match PAPER_POLICY_PROFILE to allow test
+
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
 
 

@@ -384,25 +384,28 @@ INSERT INTO upbit_order_attempts
     (ts, symbol, action, mode, side, ord_type,
      price, volume, paper_trade_id, response_json, status, error_msg,
      uuid, identifier, request_json, http_status, latency_ms, remaining_req,
-     retry_count, final_state, executed_volume, paid_fee, avg_price)
+     retry_count, final_state, executed_volume, paid_fee, avg_price,
+     blocked_reasons)
 VALUES
     (:ts, :symbol, :action, :mode, :side, :ord_type,
      :price, :volume, :paper_trade_id, :response_json, :status, :error_msg,
      :uuid, :identifier, :request_json, :http_status, :latency_ms, :remaining_req,
-     :retry_count, :final_state, :executed_volume, :paid_fee, :avg_price)
+     :retry_count, :final_state, :executed_volume, :paid_fee, :avg_price,
+     :blocked_reasons)
 ON CONFLICT (identifier, mode) WHERE identifier IS NOT NULL
 DO UPDATE SET
-    ts           = EXCLUDED.ts,
-    status       = EXCLUDED.status,
-    request_json = COALESCE(EXCLUDED.request_json,  upbit_order_attempts.request_json),
-    response_json= COALESCE(EXCLUDED.response_json, upbit_order_attempts.response_json),
-    http_status  = EXCLUDED.http_status,
-    latency_ms   = EXCLUDED.latency_ms,
-    remaining_req= EXCLUDED.remaining_req,
-    retry_count  = GREATEST(upbit_order_attempts.retry_count, EXCLUDED.retry_count),
-    error_msg    = EXCLUDED.error_msg,
-    uuid         = COALESCE(EXCLUDED.uuid, upbit_order_attempts.uuid),
-    final_state  = COALESCE(EXCLUDED.final_state, upbit_order_attempts.final_state)
+    ts              = EXCLUDED.ts,
+    status          = EXCLUDED.status,
+    request_json    = COALESCE(EXCLUDED.request_json,  upbit_order_attempts.request_json),
+    response_json   = COALESCE(EXCLUDED.response_json, upbit_order_attempts.response_json),
+    http_status     = EXCLUDED.http_status,
+    latency_ms      = EXCLUDED.latency_ms,
+    remaining_req   = EXCLUDED.remaining_req,
+    retry_count     = GREATEST(upbit_order_attempts.retry_count, EXCLUDED.retry_count),
+    error_msg       = EXCLUDED.error_msg,
+    uuid            = COALESCE(EXCLUDED.uuid, upbit_order_attempts.uuid),
+    final_state     = COALESCE(EXCLUDED.final_state, upbit_order_attempts.final_state),
+    blocked_reasons = COALESCE(EXCLUDED.blocked_reasons, upbit_order_attempts.blocked_reasons)
 RETURNING id
 """)
 
@@ -433,11 +436,13 @@ def insert_upbit_order_attempt(engine: Engine, row: dict) -> int | None:
         "executed_volume": None,
         "paid_fee": None,
         "avg_price": None,
+        "blocked_reasons": None,
     }
     merged = {**defaults, **row}
     # Serialize JSONB fields for psycopg3 text() queries
     merged["response_json"] = _j(merged.get("response_json"))
     merged["request_json"] = _j(merged.get("request_json"))
+    merged["blocked_reasons"] = _j(merged.get("blocked_reasons"))
     with engine.begin() as conn:
         result = conn.execute(_UPSERT_UPBIT_ORDER_ATTEMPT, merged)
         row_res = result.fetchone()

@@ -249,28 +249,33 @@ class ShadowExecutionRunner:
         identifier = f"paper-{paper_trade_id}-{action}"
 
         # ── Step 9: App-level idempotency (optimisation before DB upsert) ─────
-        # DB upsert is the primary defense; this is a fast pre-check.
         if self._has_final_status(identifier, mode):
-            log.debug("Idempotency skip (final status exists): identifier=%s mode=%s", identifier, mode)
+            log.debug("Idempotency skip: identifier=%s mode=%s", identifier, mode)
             return
 
-        # ── Order parameters ───────────────────────────────────
+        # ── Order parameters ─────────────────────────────────────────────────
         # ENTER_LONG: 시장가 매수(금액 기반, ord_type="price")
         # EXIT_LONG:  시장가 매도(수량 기반, ord_type="market")
         if action == "ENTER_LONG":
             side = "bid"
             ord_type = "price"
-            qty = trade.get("qty") or 0
-            price = trade.get("price") or 0
-            order_price = price * qty if price and qty else None
+            # Step 11: use UPBIT_TEST_BUY_KRW for test, else derive from paper trade
+            if mode == "test":
+                order_price = float(self.settings.UPBIT_TEST_BUY_KRW)
+            else:
+                qty = trade.get("qty") or 0
+                price = trade.get("price") or 0
+                order_price = price * qty if price and qty else None
             order_volume = None
         else:  # EXIT_LONG
             side = "ask"
             ord_type = "market"
-            order_volume = trade.get("qty")
+            # Use paper trade qty; fallback to UPBIT_TEST_SELL_BTC
+            paper_qty = trade.get("qty") or 0
+            order_volume = paper_qty if paper_qty > 0 else self.settings.UPBIT_TEST_SELL_BTC
             order_price = None
 
-        # request_json (민감정보 제외)
+        # request_json (no secrets)
         request_json: dict = {
             "market": self.settings.SYMBOL,
             "side": side,
@@ -282,87 +287,174 @@ class ShadowExecutionRunner:
         if order_volume is not None:
             request_json["volume"] = str(order_volume)
 
-        # ── Execute by mode ────────────────────────────────────
-        response_json: dict | None = None
-        status = "logged"
-        error_msg: str | None = None
-        uuid: str | None = None
-        http_status: int | None = None
-        latency_ms: int | None = None
-        remaining_req_raw: str | None = None
-        retry_count = self._get_next_retry_count(paper_trade_id, action)
+        # ── Step 11: collect blocked_reasons ──────────────────────────────────
+        blocked_reasons = self._collect_blocked_reasons()
 
-        try:
-            if mode == "shadow":
+        # Base row fields shared across all status paths
+        retry_count = self._get_next_retry_count(paper_trade_id, action)
+        base_row: dict = {
+            "ts": datetime.now(timezone.utc),
+            "symbol": self.settings.SYMBOL,
+            "action": action,
+            "mode": mode,
+            "side": side,
+            "ord_type": ord_type,
+            "price": order_price,
+            "volume": order_volume,
+            "paper_trade_id": paper_trade_id,
+            "response_json": None,
+            "error_msg": None,
+            "uuid": None,
+            "identifier": identifier,
+            "request_json": request_json,
+            "http_status": None,
+            "latency_ms": None,
+            "remaining_req": None,
+            "retry_count": retry_count,
+            "final_state": None,
+            "executed_volume": None,
+            "paid_fee": None,
+            "avg_price": None,
+            "blocked_reasons": blocked_reasons if blocked_reasons else None,
+        }
+
+        # ── THROTTLED: always takes priority ─────────────────────────────────
+        if "THROTTLED" in blocked_reasons:
+            log.warning("Throttled [%s]: remaining-req.sec too low, skipping", action)
+            insert_upbit_order_attempt(self.engine, {**base_row, "status": "throttled"})
+            return
+
+        # ── SHADOW mode ───────────────────────────────────────────────────────
+        if mode == "shadow":
+            # Intentional shadow (UPBIT_TRADE_MODE=shadow or ORDER_TEST_ENABLED=False)?
+            # → status="logged" (normal shadow operation)
+            # Downgraded to shadow (user wanted test but missing keys/config)?
+            # → status="blocked" so dashboard can show why
+            intentional = (
+                self.settings.UPBIT_TRADE_MODE == "shadow"
+                or not self.settings.UPBIT_ORDER_TEST_ENABLED
+            )
+            if intentional:
+                status = "logged"
                 log.info(
                     "Shadow [%s]: side=%s ord_type=%s volume=%s price=%s (no API call)",
                     action, side, ord_type, order_volume, order_price,
                 )
-                status = "logged"
+            else:
+                # UPBIT_TRADE_MODE=test but downgraded (e.g. KEYS_MISSING)
+                status = "blocked"
+                reasons_str = ",".join(blocked_reasons)
+                log.warning("Blocked [%s]: %s (downgraded to shadow)", action, reasons_str)
+                base_row["error_msg"] = f"blocked: {reasons_str}"
+            insert_upbit_order_attempt(self.engine, {**base_row, "status": status})
+            return
 
-            elif mode == "test":
-                # Step 9: remaining-req throttle check
-                if self._is_throttled():
-                    log.warning(
-                        "Throttled [%s]: remaining-req.sec too low, skipping API call",
-                        action,
-                    )
-                    status = "throttled"
-                else:
-                    log.info(
-                        "Test [%s]: POST /v1/orders/test side=%s ord_type=%s",
-                        action, side, ord_type,
-                    )
-                    result = self.client.order_test(
-                        market=self.settings.SYMBOL,
-                        side=side,
-                        volume=order_volume,
-                        price=order_price,
-                        ord_type=ord_type,
-                        identifier=identifier,
-                    )
-                    meta = self.client._last_call_meta
-                    response_json = result
-                    status = "test_ok"
-                    http_status = meta.get("http_status")
-                    latency_ms = meta.get("latency_ms")
-                    remaining_req_raw = meta.get("remaining_req")
-                    parsed = meta.get("remaining_req_parsed", {})
-                    log.info(
-                        "Test OK: latency=%dms http=%s remaining-req sec=%s min=%s",
-                        latency_ms or 0, http_status,
-                        parsed.get("sec"), parsed.get("min"),
-                    )
+        # ── TEST mode: runtime blocking checks ───────────────────────────────
+        if mode == "test":
+            # Runtime blocks (AUTO_TEST_DISABLED, PAPER_PROFILE_MISMATCH, DATA_LAG)
+            runtime_blocks = [
+                r for r in blocked_reasons
+                if r not in ("KEYS_MISSING", "TEST_DISABLED")
+            ]
+            if runtime_blocks:
+                reasons_str = ",".join(runtime_blocks)
+                log.warning("Blocked test [%s]: %s", action, reasons_str)
+                insert_upbit_order_attempt(self.engine, {
+                    **base_row,
+                    "status": "blocked",
+                    "error_msg": f"blocked: {reasons_str}",
+                })
+                return
 
-            elif mode == "live":
-                # Step 9: remaining-req throttle check
-                if self._is_throttled():
-                    log.warning(
-                        "Throttled LIVE [%s]: remaining-req.sec too low, skipping",
-                        action,
-                    )
-                    status = "throttled"
-                else:
-                    log.warning(
-                        "LIVE [%s]: POST /v1/orders side=%s ord_type=%s (LIVE_TRADING_ENABLED=True)",
-                        action, side, ord_type,
-                    )
-                    result = self.client.create_order(
-                        market=self.settings.SYMBOL,
-                        side=side,
-                        volume=order_volume,
-                        price=order_price,
-                        ord_type=ord_type,
-                        identifier=identifier,
-                    )
-                    meta = self.client._last_call_meta
-                    response_json = result
-                    status = "submitted"
-                    uuid = result.get("uuid")
-                    http_status = meta.get("http_status")
-                    latency_ms = meta.get("latency_ms")
-                    remaining_req_raw = meta.get("remaining_req")
-                    log.info("Live order submitted: uuid=%s latency=%dms", uuid, latency_ms or 0)
+            # ── All clear: call POST /v1/orders/test ────────────────────────
+            response_json: dict | None = None
+            status = "test_ok"
+            error_msg: str | None = None
+            uuid: str | None = None
+            http_status: int | None = None
+            latency_ms: int | None = None
+            remaining_req_raw: str | None = None
+
+            try:
+                log.info(
+                    "Test [%s]: POST /v1/orders/test side=%s ord_type=%s price=%s vol=%s",
+                    action, side, ord_type, order_price, order_volume,
+                )
+                result = self.client.order_test(
+                    market=self.settings.SYMBOL,
+                    side=side,
+                    volume=order_volume,
+                    price=order_price,
+                    ord_type=ord_type,
+                    identifier=identifier,
+                )
+                meta = self.client._last_call_meta
+                response_json = result
+                status = "test_ok"
+                http_status = meta.get("http_status")
+                latency_ms = meta.get("latency_ms")
+                remaining_req_raw = meta.get("remaining_req")
+                parsed = meta.get("remaining_req_parsed", {}) or {}
+                log.info(
+                    "Test OK [%s]: latency=%dms http=%s remaining-req sec=%s min=%s",
+                    action, latency_ms or 0, http_status,
+                    parsed.get("sec"), parsed.get("min"),
+                )
+
+            except UpbitApiError as e:
+                error_msg = str(e)
+                status = "error"
+                http_status = e.http_status
+                remaining_req_raw = e.remaining_req
+                log.error("ShadowExecutionRunner API error [%s]: %s", action, e)
+            except Exception as e:
+                error_msg = str(e)
+                status = "error"
+                log.error("ShadowExecutionRunner error [%s]: %s", action, e)
+
+            insert_upbit_order_attempt(self.engine, {
+                **base_row,
+                "response_json": response_json,
+                "status": status,
+                "error_msg": error_msg,
+                "uuid": uuid,
+                "http_status": http_status,
+                "latency_ms": latency_ms,
+                "remaining_req": remaining_req_raw,
+                "blocked_reasons": None,  # clear on successful test
+            })
+            return
+
+        # ── LIVE mode ─────────────────────────────────────────────────────────
+        response_json = None
+        status = "submitted"
+        error_msg = None
+        uuid = None
+        http_status = None
+        latency_ms = None
+        remaining_req_raw = None
+
+        try:
+            log.warning(
+                "LIVE [%s]: POST /v1/orders side=%s ord_type=%s (LIVE_TRADING_ENABLED=True)",
+                action, side, ord_type,
+            )
+            result = self.client.create_order(
+                market=self.settings.SYMBOL,
+                side=side,
+                volume=order_volume,
+                price=order_price,
+                ord_type=ord_type,
+                identifier=identifier,
+            )
+            meta = self.client._last_call_meta
+            response_json = result
+            status = "submitted"
+            uuid = result.get("uuid")
+            http_status = meta.get("http_status")
+            latency_ms = meta.get("latency_ms")
+            remaining_req_raw = meta.get("remaining_req")
+            log.info("Live order submitted: uuid=%s latency=%dms", uuid, latency_ms or 0)
 
         except UpbitApiError as e:
             error_msg = str(e)
@@ -375,35 +467,20 @@ class ShadowExecutionRunner:
             status = "error"
             log.error("ShadowExecutionRunner error [%s]: %s", action, e)
 
-        row = {
-            "ts": datetime.now(timezone.utc),
-            "symbol": self.settings.SYMBOL,
-            "action": action,
-            "mode": mode,
-            "side": side,
-            "ord_type": ord_type,
-            "price": order_price,
-            "volume": order_volume,
-            "paper_trade_id": paper_trade_id,
+        attempt_id = insert_upbit_order_attempt(self.engine, {
+            **base_row,
             "response_json": response_json,
             "status": status,
             "error_msg": error_msg,
             "uuid": uuid,
-            "identifier": identifier,
-            "request_json": request_json,
             "http_status": http_status,
             "latency_ms": latency_ms,
             "remaining_req": remaining_req_raw,
-            "retry_count": retry_count,
-            "final_state": None,
-            "executed_volume": None,
-            "paid_fee": None,
-            "avg_price": None,
-        }
-        attempt_id = insert_upbit_order_attempt(self.engine, row)
+            "blocked_reasons": None,
+        })
 
         # Live mode: poll order until done/cancel
-        if mode == "live" and uuid and attempt_id is not None:
+        if uuid and attempt_id is not None:
             self._poll_live_order(attempt_id, uuid)
 
     def _poll_live_order(self, attempt_id: int, uuid: str) -> None:
@@ -528,6 +605,48 @@ class ShadowExecutionRunner:
             )
             return True
         return False
+
+    def _collect_blocked_reasons(self) -> list[str]:
+        """Step 11: Collect all reasons why a Upbit API call cannot be made right now.
+
+        Checks config-level conditions (KEYS_MISSING, TEST_DISABLED, AUTO_TEST_DISABLED,
+        PAPER_PROFILE_MISMATCH) and runtime conditions (THROTTLED, DATA_LAG).
+        """
+        reasons: list[str] = []
+        s = self.settings
+
+        # Config-level checks
+        if not s.UPBIT_ACCESS_KEY or not s.UPBIT_SECRET_KEY:
+            reasons.append("KEYS_MISSING")
+        if s.UPBIT_TRADE_MODE != "test" or not s.UPBIT_ORDER_TEST_ENABLED:
+            reasons.append("TEST_DISABLED")
+        if not s.UPBIT_TEST_ON_PAPER_TRADES:
+            reasons.append("AUTO_TEST_DISABLED")
+        if s.PAPER_POLICY_PROFILE != s.UPBIT_TEST_REQUIRE_PAPER_PROFILE:
+            reasons.append("PAPER_PROFILE_MISMATCH")
+
+        # Runtime: remaining-req throttle
+        if self._is_throttled():
+            reasons.append("THROTTLED")
+
+        # Runtime: DATA_LAG — market_1s freshness
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT ts FROM market_1s WHERE symbol=:sym ORDER BY ts DESC LIMIT 1"),
+                    {"sym": s.SYMBOL},
+                ).fetchone()
+            if row is not None:
+                ts = row.ts
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                lag = (datetime.now(timezone.utc) - ts).total_seconds()
+                if lag > s.DATA_LAG_SEC_MAX:
+                    reasons.append("DATA_LAG")
+        except Exception:
+            pass
+
+        return reasons
 
     def _determine_mode(self) -> str:
         s = self.settings

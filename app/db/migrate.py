@@ -313,4 +313,11 @@ def apply_migrations(engine: Engine) -> None:
         """))
         log.info("Applied: ux_upbit_order_attempts_identifier_mode (CREATE UNIQUE INDEX IF NOT EXISTS)")
 
-    log.info("All migrations complete (v1 + Step 7 + Step 8 + Step 9)")
+        # (14) upbit_order_attempts: blocked_reasons JSONB (Step 11)
+        conn.execute(text("""
+            ALTER TABLE upbit_order_attempts
+            ADD COLUMN IF NOT EXISTS blocked_reasons JSONB
+        """))
+        log.info("Applied: upbit_order_attempts.blocked_reasons JSONB (Step 11)")
+
+    log.info("All migrations complete (v1 + Step 7 + Step 8 + Step 9 + Step 11)")

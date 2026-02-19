@@ -706,7 +706,7 @@ def main() -> None:
     else:
         st.info("주문 시도 기록 없음 (ShadowExecutionRunner가 paper_trades를 감지하면 자동 생성)")
 
-    # Step 9: 24h 상태 분포 집계
+    # Step 9/11: 24h 상태 분포 집계 (test_ok 강조)
     st.subheader("주문 상태 분포 (최근 24h)")
     try:
         with engine.connect() as conn:
@@ -726,9 +726,46 @@ def main() -> None:
         dist_df = pd.DataFrame()
 
     if not dist_df.empty:
+        test_ok_total = int(dist_df[dist_df["status"] == "test_ok"]["cnt"].sum()) if "status" in dist_df.columns else 0
+        blocked_total = int(dist_df[dist_df["status"] == "blocked"]["cnt"].sum()) if "status" in dist_df.columns else 0
+        throttled_total = int(dist_df[dist_df["status"] == "throttled"]["cnt"].sum()) if "status" in dist_df.columns else 0
+        ds1, ds2, ds3 = st.columns(3)
+        ds1.metric("test_ok (24h)", test_ok_total)
+        ds2.metric("blocked (24h)", blocked_total)
+        ds3.metric("throttled (24h)", throttled_total)
         st.dataframe(dist_df, use_container_width=True)
     else:
         st.info("24h 데이터 없음")
+
+    # Step 11: blocked_reasons top N
+    st.subheader("blocked_reasons 분포 (최근 24h, 상위 8개)")
+    try:
+        with engine.connect() as conn:
+            br_df = pd.read_sql_query(
+                text("""
+                    SELECT reason, count(*) AS cnt
+                    FROM (
+                        SELECT jsonb_array_elements_text(blocked_reasons) AS reason
+                        FROM upbit_order_attempts
+                        WHERE symbol = :sym
+                          AND blocked_reasons IS NOT NULL
+                          AND ts >= now() - interval '24 hours'
+                    ) sub
+                    GROUP BY reason
+                    ORDER BY cnt DESC
+                    LIMIT 8
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception:
+        br_df = pd.DataFrame()
+
+    if not br_df.empty:
+        st.dataframe(br_df, use_container_width=True)
+        st.bar_chart(br_df.set_index("reason")["cnt"])
+    else:
+        st.info("blocked_reasons 없음 (정상: shadow 모드이거나 test_ok 진행 중)")
 
     # Step 9: Duplicate identifier 체크 (0건이어야 정상)
     st.subheader("중복 identifier 검사 (0건이어야 정상)")
