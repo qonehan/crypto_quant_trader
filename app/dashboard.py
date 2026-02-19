@@ -757,6 +757,103 @@ def main() -> None:
         st.error(f"⚠️ identifier 중복 {len(dup_df)}건 발견!")
         st.dataframe(dup_df, use_container_width=True)
 
+    # (3b) Step 10: Upbit Ready 상태
+    st.subheader("Upbit Ready 상태 (Step 10)")
+    not_ready_reasons: list[str] = []
+    if not has_key:
+        not_ready_reasons.append("KEYS_MISSING")
+
+    # Account snapshot freshness
+    acct_fresh = False
+    snap_lag_sec: float | None = None
+    snap_ts_str = "N/A"
+    try:
+        with engine.connect() as conn:
+            snap_row = conn.execute(
+                text("""
+                    SELECT ts FROM upbit_account_snapshots
+                    WHERE symbol = :sym ORDER BY ts DESC LIMIT 1
+                """),
+                {"sym": settings.SYMBOL},
+            ).fetchone()
+        if snap_row is not None:
+            snap_ts = snap_row.ts
+            if snap_ts.tzinfo is None:
+                snap_ts = snap_ts.replace(tzinfo=timezone.utc)
+            snap_lag_sec = (now_utc - snap_ts).total_seconds()
+            threshold_sec = settings.UPBIT_ACCOUNT_POLL_SEC * 3
+            acct_fresh = snap_lag_sec <= threshold_sec
+            snap_ts_str = str(snap_ts)[:19]
+        else:
+            snap_lag_sec = None
+    except Exception:
+        pass
+
+    if not acct_fresh:
+        not_ready_reasons.append("ACCOUNT_STALE")
+
+    # remaining-req throttle check (from last order attempt)
+    rr_throttled = False
+    try:
+        with engine.connect() as conn:
+            rr_row = conn.execute(
+                text("""
+                    SELECT remaining_req FROM upbit_order_attempts
+                    WHERE symbol = :sym AND remaining_req IS NOT NULL
+                    ORDER BY ts DESC LIMIT 1
+                """),
+                {"sym": settings.SYMBOL},
+            ).fetchone()
+        if rr_row is not None:
+            from app.exchange.upbit_rest import parse_remaining_req as _parse_rr
+            parsed_rr = _parse_rr(rr_row.remaining_req)
+            sec_val = parsed_rr.get("sec")
+            if sec_val is not None and sec_val <= 1:
+                rr_throttled = True
+                not_ready_reasons.append("THROTTLED")
+    except Exception:
+        pass
+
+    # test_ok count
+    test_ok_cnt = 0
+    try:
+        with engine.connect() as conn:
+            test_ok_cnt = conn.execute(
+                text("""
+                    SELECT count(*) FROM upbit_order_attempts
+                    WHERE symbol = :sym AND mode = 'test' AND status = 'test_ok'
+                """),
+                {"sym": settings.SYMBOL},
+            ).scalar() or 0
+    except Exception:
+        pass
+
+    # Determine ready label
+    if not not_ready_reasons:
+        if settings.LIVE_TRADING_ENABLED:
+            ready_label = "✅ LIVE READY"
+        else:
+            ready_label = "✅ TEST READY (실거래 비활성)"
+        st.success(ready_label)
+    else:
+        st.error(f"❌ NOT READY — {', '.join(not_ready_reasons)}")
+
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("API Keys", "✅ set" if has_key else "❌ not set")
+    r2.metric(
+        "Account Fresh",
+        f"{'✅' if acct_fresh else '❌'} lag={snap_lag_sec:.0f}s" if snap_lag_sec is not None else "❌ no data"
+    )
+    r3.metric("Throttled", f"{'⚠️ YES' if rr_throttled else '✅ NO'}")
+    r4.metric("test_ok 건수", test_ok_cnt)
+    st.caption(
+        f"마지막 account snapshot: {snap_ts_str}  "
+        f"| ACCOUNT_POLL_SEC={settings.UPBIT_ACCOUNT_POLL_SEC}  "
+        f"| freshness_threshold={settings.UPBIT_ACCOUNT_POLL_SEC * 3}s"
+    )
+    if not_ready_reasons:
+        st.caption(f"Not ready 사유: {not_ready_reasons}")
+
     # (4) Order snapshots (live mode only)
     st.subheader("주문 상태 스냅샷 (upbit_order_snapshots, 최근 50건 — live 모드 전용)")
     try:

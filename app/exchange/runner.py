@@ -66,7 +66,48 @@ class UpbitAccountRunner:
                 log.info("UpbitAccountRunner backoff: next poll in %ds", self._poll_interval)
             await asyncio.sleep(self._poll_interval)
 
+    def _is_throttled(self) -> bool:
+        """Step 10: remaining-req.sec throttle guard for AccountRunner."""
+        meta = self.client._last_call_meta
+        parsed = meta.get("remaining_req_parsed")
+        if not parsed:
+            return False
+        sec = parsed.get("sec")
+        if sec is not None and sec <= _THROTTLE_SEC_THRESHOLD:
+            log.warning(
+                "AccountRunner throttled: remaining-req.sec=%d <= threshold=%d — skipping poll",
+                sec, _THROTTLE_SEC_THRESHOLD,
+            )
+            return True
+        return False
+
+    def _account_freshness(self) -> tuple[bool, float | None]:
+        """Step 10: Return (is_fresh, lag_sec) based on last snapshot timestamp."""
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text("""
+                        SELECT ts FROM upbit_account_snapshots
+                        WHERE symbol = :sym ORDER BY ts DESC LIMIT 1
+                    """),
+                    {"sym": self.settings.SYMBOL},
+                ).fetchone()
+            if row is None:
+                return False, None
+            ts = row.ts
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            lag = (datetime.now(timezone.utc) - ts).total_seconds()
+            threshold = self.settings.UPBIT_ACCOUNT_POLL_SEC * 3
+            return lag <= threshold, lag
+        except Exception:
+            return False, None
+
     def _poll_once(self) -> None:
+        # Step 10: throttle guard — skip poll if remaining-req.sec is too low
+        if self._is_throttled():
+            return
+
         accounts = self.client.get_accounts()
         now = datetime.now(timezone.utc)
 
@@ -111,10 +152,14 @@ class UpbitAccountRunner:
                 "position_status": pos_status,
             })
 
+        # Step 10: account freshness check (log for dashboard Ready signal)
+        is_fresh, lag_sec = self._account_freshness()
         log.info(
-            "UpbitAccountRunner: saved %d account snapshots  remaining-req=%s",
+            "UpbitAccountRunner: saved %d snapshots  remaining-req=%s  account_fresh=%s lag=%.1fs",
             len(accounts),
             self.client._last_call_meta.get("remaining_req", "n/a"),
+            is_fresh,
+            lag_sec if lag_sec is not None else -1.0,
         )
 
 

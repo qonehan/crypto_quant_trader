@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     LIVE_ORDER_POLL_INTERVAL_SEC: int = 5
     LIVE_ORDER_MAX_POLLS: int = 24  # up to 120s total
 
+    # E2E test order parameters (Step 10)
+    UPBIT_E2E_TEST_ORDER_KRW: int = 10000   # BUY order_test KRW amount
+    UPBIT_E2E_TEST_SELL_BTC: float = 0.0001  # SELL order_test BTC volume (skip if balance insufficient)
+
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
 
 
