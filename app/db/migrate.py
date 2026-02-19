@@ -305,4 +305,12 @@ def apply_migrations(engine: Engine) -> None:
         conn.execute(_CREATE_LIVE_POSITIONS)
         log.info("Applied: live_positions table (CREATE IF NOT EXISTS)")
 
-    log.info("All migrations complete (v1 + Step 7 + Step 8)")
+        # (13) upbit_order_attempts: unique index for idempotency (Step 9)
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_upbit_order_attempts_identifier_mode
+            ON upbit_order_attempts (identifier, mode)
+            WHERE identifier IS NOT NULL
+        """))
+        log.info("Applied: ux_upbit_order_attempts_identifier_mode (CREATE UNIQUE INDEX IF NOT EXISTS)")
+
+    log.info("All migrations complete (v1 + Step 7 + Step 8 + Step 9)")

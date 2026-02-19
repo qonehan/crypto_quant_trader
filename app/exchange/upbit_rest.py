@@ -1,8 +1,9 @@
-"""Upbit v1 REST 클라이언트 (동기 httpx 기반) — Step 8 안정화."""
+"""Upbit v1 REST 클라이언트 (동기 httpx 기반) — Step 9 안정화."""
 from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from typing import Any
 
@@ -14,6 +15,36 @@ log = logging.getLogger(__name__)
 
 # HTTP status codes that warrant a retry
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def parse_remaining_req(raw: str | None) -> dict:
+    """Upbit remaining-req 헤더 파싱.
+
+    형식 예: "group=default; min=900; sec=30"
+
+    반환: {group: str|None, min: int|None, sec: int|None, raw: str|None}
+    파싱 실패 시 raw만 보존, 나머지는 None.
+    """
+    result: dict = {"group": None, "min": None, "sec": None, "raw": raw}
+    if not raw:
+        return result
+    try:
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, val = part.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if key == "group":
+                result["group"] = val
+            elif key == "min":
+                result["min"] = int(val)
+            elif key == "sec":
+                result["sec"] = int(val)
+    except Exception:
+        pass  # Keep raw only
+    return result
 
 
 class UpbitApiError(Exception):
@@ -39,6 +70,10 @@ class UpbitRestClient:
     - UpbitApiError 표준화 (runner가 status/error_msg 기록 용이)
     - order_test: POST /v1/orders/test 직접 호출 (dry-run)
     - create_order / order_test에 identifier 파라미터 지원
+
+    Step 9 추가:
+    - parse_remaining_req() — remaining-req 헤더 파싱
+    - _last_call_meta에 remaining_req_parsed 추가
     """
 
     def __init__(
@@ -101,6 +136,7 @@ class UpbitRestClient:
                 self._last_call_meta = {
                     "http_status": http_status,
                     "remaining_req": remaining_req,
+                    "remaining_req_parsed": parse_remaining_req(remaining_req),
                     "latency_ms": latency_ms,
                 }
 

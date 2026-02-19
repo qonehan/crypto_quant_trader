@@ -689,15 +689,73 @@ def main() -> None:
         test_n = int((oa_df["mode"] == "test").sum())
         live_n = int((oa_df["mode"] == "live").sum())
         error_n = int((oa_df["status"] == "error").sum())
-        f1, f2, f3, f4, f5 = st.columns(5)
+        throttled_n = int((oa_df["status"] == "throttled").sum())
+        f1, f2, f3, f4, f5, f6 = st.columns(6)
         f1.metric("Total", total)
         f2.metric("Shadow", shadow_n)
         f3.metric("Test", test_n)
         f4.metric("Live", live_n)
         f5.metric("Errors", error_n)
+        f6.metric("Throttled", throttled_n)
         st.dataframe(oa_df, use_container_width=True, height=350)
+
+        # Step 9: remaining-req 마지막 값 표시
+        last_rr = oa_df[oa_df["remaining_req"].notna()]["remaining_req"].iloc[0] if oa_df["remaining_req"].notna().any() else None
+        if last_rr:
+            st.caption(f"최근 remaining-req: `{last_rr}`")
     else:
         st.info("주문 시도 기록 없음 (ShadowExecutionRunner가 paper_trades를 감지하면 자동 생성)")
+
+    # Step 9: 24h 상태 분포 집계
+    st.subheader("주문 상태 분포 (최근 24h)")
+    try:
+        with engine.connect() as conn:
+            dist_df = pd.read_sql_query(
+                text("""
+                    SELECT status, mode, count(*) AS cnt
+                    FROM upbit_order_attempts
+                    WHERE symbol = :sym
+                      AND ts >= now() - interval '24 hours'
+                    GROUP BY status, mode
+                    ORDER BY cnt DESC
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception:
+        dist_df = pd.DataFrame()
+
+    if not dist_df.empty:
+        st.dataframe(dist_df, use_container_width=True)
+    else:
+        st.info("24h 데이터 없음")
+
+    # Step 9: Duplicate identifier 체크 (0건이어야 정상)
+    st.subheader("중복 identifier 검사 (0건이어야 정상)")
+    try:
+        with engine.connect() as conn:
+            dup_df = pd.read_sql_query(
+                text("""
+                    SELECT identifier, mode, count(*) AS cnt
+                    FROM upbit_order_attempts
+                    WHERE symbol = :sym
+                      AND identifier IS NOT NULL
+                    GROUP BY identifier, mode
+                    HAVING count(*) > 1
+                    ORDER BY cnt DESC
+                    LIMIT 20
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception:
+        dup_df = pd.DataFrame()
+
+    if dup_df.empty:
+        st.success("✅ identifier 중복 없음 — DB unique 제약 정상 동작")
+    else:
+        st.error(f"⚠️ identifier 중복 {len(dup_df)}건 발견!")
+        st.dataframe(dup_df, use_container_width=True)
 
     # (4) Order snapshots (live mode only)
     st.subheader("주문 상태 스냅샷 (upbit_order_snapshots, 최근 50건 — live 모드 전용)")

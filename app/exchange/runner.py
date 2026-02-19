@@ -1,4 +1,4 @@
-"""Upbit 계좌 스냅샷 및 실행 Runner — Step 8 업그레이드."""
+"""Upbit 계좌 스냅샷 및 실행 Runner — Step 9 안정화."""
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +18,13 @@ from app.db.writer import (
     update_upbit_order_attempt_final,
     upsert_live_position,
 )
-from app.exchange.upbit_rest import UpbitApiError, UpbitRestClient
+from app.exchange.upbit_rest import UpbitApiError, UpbitRestClient, parse_remaining_req
+
+# remaining-req.sec 임계값: 이 값 이하이면 API 호출을 스로틀
+_THROTTLE_SEC_THRESHOLD = 1
+
+# Step 9: Final statuses — DB upsert 후 이 상태이면 추가 처리 스킵
+_FINAL_STATUSES = frozenset({"submitted", "done", "cancel", "test_ok", "logged"})
 
 log = logging.getLogger(__name__)
 
@@ -195,18 +201,13 @@ class ShadowExecutionRunner:
 
         paper_trade_id = trade["id"]
         mode = self._determine_mode()
-
-        # ── Idempotency check ──────────────────────────────────
-        skip_status = self._check_idempotency(paper_trade_id, action)
-        if skip_status is not None:
-            log.debug(
-                "Idempotency skip: paper_trade_id=%d action=%s existing=%s",
-                paper_trade_id, action, skip_status,
-            )
-            return
-
-        retry_count = self._get_next_retry_count(paper_trade_id, action)
         identifier = f"paper-{paper_trade_id}-{action}"
+
+        # ── Step 9: App-level idempotency (optimisation before DB upsert) ─────
+        # DB upsert is the primary defense; this is a fast pre-check.
+        if self._has_final_status(identifier, mode):
+            log.debug("Idempotency skip (final status exists): identifier=%s mode=%s", identifier, mode)
+            return
 
         # ── Order parameters ───────────────────────────────────
         # ENTER_LONG: 시장가 매수(금액 기반, ord_type="price")
@@ -214,7 +215,6 @@ class ShadowExecutionRunner:
         if action == "ENTER_LONG":
             side = "bid"
             ord_type = "price"
-            # Use cash_after context to estimate KRW amount; fallback to price*qty
             qty = trade.get("qty") or 0
             price = trade.get("price") or 0
             order_price = price * qty if price and qty else None
@@ -244,8 +244,8 @@ class ShadowExecutionRunner:
         uuid: str | None = None
         http_status: int | None = None
         latency_ms: int | None = None
-        remaining_req: str | None = None
-        attempt_id: int | None = None
+        remaining_req_raw: str | None = None
+        retry_count = self._get_next_retry_count(paper_trade_id, action)
 
         try:
             if mode == "shadow":
@@ -256,56 +256,74 @@ class ShadowExecutionRunner:
                 status = "logged"
 
             elif mode == "test":
-                log.info(
-                    "Test [%s]: POST /v1/orders/test side=%s ord_type=%s",
-                    action, side, ord_type,
-                )
-                result = self.client.order_test(
-                    market=self.settings.SYMBOL,
-                    side=side,
-                    volume=order_volume,
-                    price=order_price,
-                    ord_type=ord_type,
-                    identifier=identifier,
-                )
-                meta = self.client._last_call_meta
-                response_json = result
-                status = "test_ok"
-                http_status = meta.get("http_status")
-                latency_ms = meta.get("latency_ms")
-                remaining_req = meta.get("remaining_req")
-                log.info(
-                    "Test OK: latency=%dms http=%s remaining-req=%s",
-                    latency_ms or 0, http_status, remaining_req,
-                )
+                # Step 9: remaining-req throttle check
+                if self._is_throttled():
+                    log.warning(
+                        "Throttled [%s]: remaining-req.sec too low, skipping API call",
+                        action,
+                    )
+                    status = "throttled"
+                else:
+                    log.info(
+                        "Test [%s]: POST /v1/orders/test side=%s ord_type=%s",
+                        action, side, ord_type,
+                    )
+                    result = self.client.order_test(
+                        market=self.settings.SYMBOL,
+                        side=side,
+                        volume=order_volume,
+                        price=order_price,
+                        ord_type=ord_type,
+                        identifier=identifier,
+                    )
+                    meta = self.client._last_call_meta
+                    response_json = result
+                    status = "test_ok"
+                    http_status = meta.get("http_status")
+                    latency_ms = meta.get("latency_ms")
+                    remaining_req_raw = meta.get("remaining_req")
+                    parsed = meta.get("remaining_req_parsed", {})
+                    log.info(
+                        "Test OK: latency=%dms http=%s remaining-req sec=%s min=%s",
+                        latency_ms or 0, http_status,
+                        parsed.get("sec"), parsed.get("min"),
+                    )
 
             elif mode == "live":
-                log.warning(
-                    "LIVE [%s]: POST /v1/orders side=%s ord_type=%s (LIVE_TRADING_ENABLED=True)",
-                    action, side, ord_type,
-                )
-                result = self.client.create_order(
-                    market=self.settings.SYMBOL,
-                    side=side,
-                    volume=order_volume,
-                    price=order_price,
-                    ord_type=ord_type,
-                    identifier=identifier,
-                )
-                meta = self.client._last_call_meta
-                response_json = result
-                status = "submitted"
-                uuid = result.get("uuid")
-                http_status = meta.get("http_status")
-                latency_ms = meta.get("latency_ms")
-                remaining_req = meta.get("remaining_req")
-                log.info("Live order submitted: uuid=%s latency=%dms", uuid, latency_ms or 0)
+                # Step 9: remaining-req throttle check
+                if self._is_throttled():
+                    log.warning(
+                        "Throttled LIVE [%s]: remaining-req.sec too low, skipping",
+                        action,
+                    )
+                    status = "throttled"
+                else:
+                    log.warning(
+                        "LIVE [%s]: POST /v1/orders side=%s ord_type=%s (LIVE_TRADING_ENABLED=True)",
+                        action, side, ord_type,
+                    )
+                    result = self.client.create_order(
+                        market=self.settings.SYMBOL,
+                        side=side,
+                        volume=order_volume,
+                        price=order_price,
+                        ord_type=ord_type,
+                        identifier=identifier,
+                    )
+                    meta = self.client._last_call_meta
+                    response_json = result
+                    status = "submitted"
+                    uuid = result.get("uuid")
+                    http_status = meta.get("http_status")
+                    latency_ms = meta.get("latency_ms")
+                    remaining_req_raw = meta.get("remaining_req")
+                    log.info("Live order submitted: uuid=%s latency=%dms", uuid, latency_ms or 0)
 
         except UpbitApiError as e:
             error_msg = str(e)
             status = "error"
             http_status = e.http_status
-            remaining_req = e.remaining_req
+            remaining_req_raw = e.remaining_req
             log.error("ShadowExecutionRunner API error [%s]: %s", action, e)
         except Exception as e:
             error_msg = str(e)
@@ -325,13 +343,12 @@ class ShadowExecutionRunner:
             "response_json": response_json,
             "status": status,
             "error_msg": error_msg,
-            # Step 8 extended columns
             "uuid": uuid,
             "identifier": identifier,
             "request_json": request_json,
             "http_status": http_status,
             "latency_ms": latency_ms,
-            "remaining_req": remaining_req,
+            "remaining_req": remaining_req_raw,
             "retry_count": retry_count,
             "final_state": None,
             "executed_volume": None,
@@ -405,35 +422,35 @@ class ShadowExecutionRunner:
             )
             log.info("Live order finalized: uuid=%s final_state=%s", uuid, final_state)
         else:
-            log.warning("Live order polling exhausted: uuid=%s (max_polls=%d)", uuid, max_polls)
+            # Step 9: poll timeout — mark with final_state="poll_timeout"
+            log.warning(
+                "Live order polling exhausted (poll_timeout): uuid=%s max_polls=%d",
+                uuid, max_polls,
+            )
+            update_upbit_order_attempt_final(
+                self.engine, attempt_id, "poll_timeout",
+                executed_volume=executed_volume,
+                paid_fee=paid_fee,
+                avg_price=avg_price,
+            )
 
-    def _check_idempotency(self, paper_trade_id: int, action: str) -> str | None:
-        """Return existing status if we should skip, None if we should proceed."""
+    def _has_final_status(self, identifier: str, mode: str) -> bool:
+        """Step 9: Check if a final-status record already exists for this (identifier, mode).
+
+        Uses the unique index for fast lookup.
+        """
         with self.engine.connect() as conn:
             row = conn.execute(
                 text("""
-                    SELECT status, COALESCE(retry_count, 0) AS retry_count
-                    FROM upbit_order_attempts
-                    WHERE paper_trade_id = :ptid AND action = :action
-                    ORDER BY ts DESC
+                    SELECT status FROM upbit_order_attempts
+                    WHERE identifier = :ident AND mode = :mode
                     LIMIT 1
                 """),
-                {"ptid": paper_trade_id, "action": action},
+                {"ident": identifier, "mode": mode},
             ).fetchone()
-
         if row is None:
-            return None  # No existing attempt — proceed
-
-        status = row.status
-        retry_count = row.retry_count
-
-        if status in ("submitted", "done", "test_ok", "logged"):
-            return status  # Already succeeded — skip
-
-        if status == "error" and retry_count < self.settings.UPBIT_REST_MAX_RETRY:
-            return None  # Allow retry
-
-        return status  # Too many errors or unknown — skip
+            return False
+        return row.status in _FINAL_STATUSES
 
     def _get_next_retry_count(self, paper_trade_id: int, action: str) -> int:
         """Return retry_count value to use for the next attempt."""
@@ -449,6 +466,23 @@ class ShadowExecutionRunner:
                 {"ptid": paper_trade_id, "action": action},
             ).fetchone()
         return row[0] if row else 0
+
+    def _is_throttled(self) -> bool:
+        """Step 9: Return True if remaining-req.sec is at or below the throttle threshold."""
+        meta = self.client._last_call_meta
+        parsed = meta.get("remaining_req_parsed")
+        if not parsed:
+            return False  # No data yet — don't throttle
+        sec = parsed.get("sec")
+        if sec is None:
+            return False
+        if sec <= _THROTTLE_SEC_THRESHOLD:
+            log.warning(
+                "remaining-req throttle: sec=%d <= threshold=%d",
+                sec, _THROTTLE_SEC_THRESHOLD,
+            )
+            return True
+        return False
 
     def _determine_mode(self) -> str:
         s = self.settings
