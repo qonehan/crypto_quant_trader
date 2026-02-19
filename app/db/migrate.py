@@ -189,6 +189,71 @@ def _add_columns(conn, table: str, col_defs: list[str], label: str) -> None:
     log.info("Applied: %s (%d columns)", label, len(col_defs))
 
 
+# ---------------------------------------------------------------------------
+# (10) upbit_order_attempts: Step 8 extended columns
+# ---------------------------------------------------------------------------
+_MIG_ORDER_ATTEMPTS_STEP8 = [
+    "uuid TEXT NULL",
+    "identifier TEXT NULL",
+    "request_json JSONB NULL",
+    "http_status INTEGER NULL",
+    "latency_ms INTEGER NULL",
+    "remaining_req TEXT NULL",
+    "retry_count INTEGER NULL DEFAULT 0",
+    "final_state TEXT NULL",
+    "executed_volume DOUBLE PRECISION NULL",
+    "paid_fee DOUBLE PRECISION NULL",
+    "avg_price DOUBLE PRECISION NULL",
+]
+
+# ---------------------------------------------------------------------------
+# (11) upbit_order_snapshots table (Step 8)
+# ---------------------------------------------------------------------------
+_CREATE_UPBIT_ORDER_SNAPSHOTS = text("""
+CREATE TABLE IF NOT EXISTS upbit_order_snapshots (
+    id               BIGSERIAL PRIMARY KEY,
+    ts               TIMESTAMPTZ NOT NULL,
+    symbol           TEXT NOT NULL,
+    uuid             TEXT NOT NULL,
+    state            TEXT NULL,
+    side             TEXT NULL,
+    ord_type         TEXT NULL,
+    price            DOUBLE PRECISION NULL,
+    volume           DOUBLE PRECISION NULL,
+    remaining_volume DOUBLE PRECISION NULL,
+    executed_volume  DOUBLE PRECISION NULL,
+    paid_fee         DOUBLE PRECISION NULL,
+    raw_json         JSONB NOT NULL,
+    UNIQUE (uuid, ts)
+)
+""")
+
+_CREATE_IDX_ORDER_SNAPSHOTS_SYM_TS = text("""
+CREATE INDEX IF NOT EXISTS ix_upbit_order_snapshots_symbol_ts
+ON upbit_order_snapshots (symbol, ts DESC)
+""")
+
+_CREATE_IDX_ORDER_SNAPSHOTS_UUID_TS = text("""
+CREATE INDEX IF NOT EXISTS ix_upbit_order_snapshots_uuid_ts
+ON upbit_order_snapshots (uuid, ts DESC)
+""")
+
+# ---------------------------------------------------------------------------
+# (12) live_positions table (Step 8 — optional but recommended)
+# ---------------------------------------------------------------------------
+_CREATE_LIVE_POSITIONS = text("""
+CREATE TABLE IF NOT EXISTS live_positions (
+    symbol               TEXT PRIMARY KEY,
+    ts                   TIMESTAMPTZ NOT NULL,
+    krw_balance          DOUBLE PRECISION,
+    btc_balance          DOUBLE PRECISION,
+    btc_avg_buy_price    DOUBLE PRECISION,
+    position_status      TEXT,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+""")
+
+
 def apply_migrations(engine: Engine) -> None:
     """Run all idempotent migrations sequentially."""
     with engine.begin() as conn:
@@ -227,4 +292,17 @@ def apply_migrations(engine: Engine) -> None:
         conn.execute(_CREATE_IDX_ORDER_ATTEMPTS_SYM_TS)
         log.info("Applied: upbit_order_attempts table (CREATE IF NOT EXISTS)")
 
-    log.info("All migrations complete (v1 + Step 7)")
+        # (10) upbit_order_attempts: Step 8 extended columns
+        _add_columns(conn, "upbit_order_attempts", _MIG_ORDER_ATTEMPTS_STEP8, "upbit_order_attempts Step 8 cols")
+
+        # (11) upbit_order_snapshots table (Step 8)
+        conn.execute(_CREATE_UPBIT_ORDER_SNAPSHOTS)
+        conn.execute(_CREATE_IDX_ORDER_SNAPSHOTS_SYM_TS)
+        conn.execute(_CREATE_IDX_ORDER_SNAPSHOTS_UUID_TS)
+        log.info("Applied: upbit_order_snapshots table (CREATE IF NOT EXISTS)")
+
+        # (12) live_positions table (Step 8)
+        conn.execute(_CREATE_LIVE_POSITIONS)
+        log.info("Applied: live_positions table (CREATE IF NOT EXISTS)")
+
+    log.info("All migrations complete (v1 + Step 7 + Step 8)")

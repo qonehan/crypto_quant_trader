@@ -593,11 +593,30 @@ def main() -> None:
 
 
     # ══════════════════════════════════════════════════════════
-    # [F] Upbit Exchange (Step 7)
+    # [F] Upbit Exchange (Step 8)
     # ══════════════════════════════════════════════════════════
     st.header("[F] Upbit Exchange")
 
-    # Account snapshots — latest balances
+    # (1) Mode / Guard status
+    st.subheader("모드 / 가드 상태")
+    live_guard = (
+        settings.LIVE_TRADING_ENABLED
+        and settings.UPBIT_TRADE_MODE == "live"
+        and settings.LIVE_GUARD_PHRASE == "I_CONFIRM_LIVE_TRADING"
+        and settings.PAPER_POLICY_PROFILE != "test"
+    )
+    has_key = bool(settings.UPBIT_ACCESS_KEY and settings.UPBIT_SECRET_KEY)
+    g1, g2, g3, g4, g5 = st.columns(5)
+    g1.metric("LIVE_TRADING_ENABLED", str(settings.LIVE_TRADING_ENABLED))
+    g2.metric("UPBIT_TRADE_MODE", settings.UPBIT_TRADE_MODE)
+    g3.metric("ORDER_TEST_ENABLED", str(settings.UPBIT_ORDER_TEST_ENABLED))
+    g4.metric("SHADOW_ENABLED", str(settings.UPBIT_SHADOW_ENABLED))
+    g5.metric("API Keys", "✅ set" if has_key else "❌ not set")
+    live_label = "🔴 LIVE ACTIVE" if live_guard else "🟢 SAFE (no live)"
+    policy_note = f"  |  POLICY_PROFILE={settings.PAPER_POLICY_PROFILE}"
+    st.info(f"Live Guard: {live_label}{policy_note}")
+
+    # (2) Account snapshots — latest balances + live_positions
     st.subheader("계좌 잔액 (최신 스냅샷)")
     try:
         with engine.connect() as conn:
@@ -622,17 +641,40 @@ def main() -> None:
     else:
         st.info("계좌 스냅샷 없음 (UPBIT_ACCESS_KEY 설정 및 UpbitAccountRunner 실행 필요)")
 
-    # Order attempts — recent shadow/test/live logs
-    st.subheader("주문 시도 로그 (upbit_order_attempts, 최근 30건)")
+    # live_positions summary
+    try:
+        with engine.connect() as conn:
+            lp_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, krw_balance, btc_balance, btc_avg_buy_price,
+                           position_status, updated_at
+                    FROM live_positions
+                    WHERE symbol = :sym
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception:
+        lp_df = pd.DataFrame()
+
+    if not lp_df.empty:
+        st.caption("실계좌 포지션 요약 (live_positions)")
+        st.dataframe(lp_df, use_container_width=True)
+
+    # (3) Order attempts — recent 50 rows with Step 8 columns
+    st.subheader("주문 시도 로그 (upbit_order_attempts, 최근 50건)")
     try:
         with engine.connect() as conn:
             oa_df = pd.read_sql_query(
                 text("""
-                    SELECT ts, action, mode, side, ord_type, price, volume,
-                           paper_trade_id, status, error_msg
+                    SELECT ts, action, mode, status, uuid, identifier,
+                           side, ord_type, price, volume,
+                           http_status, latency_ms, remaining_req,
+                           retry_count, final_state, error_msg,
+                           paper_trade_id
                     FROM upbit_order_attempts
                     WHERE symbol = :sym
-                    ORDER BY ts DESC LIMIT 30
+                    ORDER BY ts DESC LIMIT 50
                 """),
                 conn,
                 params={"sym": settings.SYMBOL},
@@ -642,35 +684,44 @@ def main() -> None:
         oa_df = pd.DataFrame()
 
     if not oa_df.empty:
-        # Summary metrics
         total = len(oa_df)
-        shadow_n = (oa_df["mode"] == "shadow").sum()
-        test_n = (oa_df["mode"] == "test").sum()
-        live_n = (oa_df["mode"] == "live").sum()
-        error_n = (oa_df["status"] == "error").sum()
+        shadow_n = int((oa_df["mode"] == "shadow").sum())
+        test_n = int((oa_df["mode"] == "test").sum())
+        live_n = int((oa_df["mode"] == "live").sum())
+        error_n = int((oa_df["status"] == "error").sum())
         f1, f2, f3, f4, f5 = st.columns(5)
         f1.metric("Total", total)
-        f2.metric("Shadow", int(shadow_n))
-        f3.metric("Test", int(test_n))
-        f4.metric("Live", int(live_n))
-        f5.metric("Errors", int(error_n))
-        st.dataframe(oa_df, use_container_width=True, height=300)
+        f2.metric("Shadow", shadow_n)
+        f3.metric("Test", test_n)
+        f4.metric("Live", live_n)
+        f5.metric("Errors", error_n)
+        st.dataframe(oa_df, use_container_width=True, height=350)
     else:
         st.info("주문 시도 기록 없음 (ShadowExecutionRunner가 paper_trades를 감지하면 자동 생성)")
 
-    # Mode indicator
-    mode_color = "🟢" if settings.UPBIT_SHADOW_ENABLED else "⚫"
-    live_guard = (
-        settings.LIVE_TRADING_ENABLED
-        and settings.UPBIT_TRADE_MODE == "live"
-        and settings.LIVE_GUARD_PHRASE == "I_CONFIRM_LIVE_TRADING"
-    )
-    st.info(
-        f"{mode_color} Shadow: {settings.UPBIT_SHADOW_ENABLED}  |  "
-        f"Trade mode: {settings.UPBIT_TRADE_MODE}  |  "
-        f"Live guard: {'🔴 LIVE' if live_guard else '🟢 SAFE'}  |  "
-        f"API key: {'✅ set' if settings.UPBIT_ACCESS_KEY else '❌ not set'}"
-    )
+    # (4) Order snapshots (live mode only)
+    st.subheader("주문 상태 스냅샷 (upbit_order_snapshots, 최근 50건 — live 모드 전용)")
+    try:
+        with engine.connect() as conn:
+            os_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, uuid, state, side, ord_type, price, volume,
+                           remaining_volume, executed_volume, paid_fee
+                    FROM upbit_order_snapshots
+                    WHERE symbol = :sym
+                    ORDER BY ts DESC LIMIT 50
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception as e:
+        st.warning(f"upbit_order_snapshots not available: {e}")
+        os_df = pd.DataFrame()
+
+    if not os_df.empty:
+        st.dataframe(os_df, use_container_width=True, height=300)
+    else:
+        st.info("주문 스냅샷 없음 (live 모드에서 실주문 시 uuid 폴링으로 자동 생성)")
 
 
 if __name__ == "__main__":

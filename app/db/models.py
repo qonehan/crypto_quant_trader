@@ -359,13 +359,25 @@ class UpbitOrderAttempt(Base):
     action = Column(Text, nullable=False)      # ENTER_LONG | EXIT_LONG
     mode = Column(Text, nullable=False)        # shadow | test | live
     side = Column(Text, nullable=False)        # bid | ask
-    ord_type = Column(Text, nullable=False)    # market | limit
+    ord_type = Column(Text, nullable=False)    # market | limit | price
     price = Column(Double, nullable=True)
     volume = Column(Double, nullable=True)
     paper_trade_id = Column(BigInteger, nullable=True)
     response_json = Column(JSONB, nullable=True)
-    status = Column(Text, nullable=False)      # logged | test_ok | submitted | error
+    status = Column(Text, nullable=False)      # logged | test_ok | submitted | error | done | cancel
     error_msg = Column(Text, nullable=True)
+    # Step 8 extended columns
+    uuid = Column(Text, nullable=True)
+    identifier = Column(Text, nullable=True)
+    request_json = Column(JSONB, nullable=True)
+    http_status = Column(Integer, nullable=True)
+    latency_ms = Column(Integer, nullable=True)
+    remaining_req = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=True, default=0)
+    final_state = Column(Text, nullable=True)
+    executed_volume = Column(Double, nullable=True)
+    paid_fee = Column(Double, nullable=True)
+    avg_price = Column(Double, nullable=True)
 
     __table_args__ = (
         Index("ix_upbit_order_attempts_ts", "ts"),
@@ -374,3 +386,49 @@ class UpbitOrderAttempt(Base):
 
     def __repr__(self) -> str:
         return f"<UpbitOrderAttempt {self.symbol} {self.action} mode={self.mode} status={self.status}>"
+
+
+class UpbitOrderSnapshot(Base):
+    """Live 주문 상태 스냅샷 (uuid 폴링)."""
+
+    __tablename__ = "upbit_order_snapshots"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    ts = Column(DateTime(timezone=True), nullable=False)
+    symbol = Column(Text, nullable=False)
+    uuid = Column(Text, nullable=False)
+    state = Column(Text, nullable=True)
+    side = Column(Text, nullable=True)
+    ord_type = Column(Text, nullable=True)
+    price = Column(Double, nullable=True)
+    volume = Column(Double, nullable=True)
+    remaining_volume = Column(Double, nullable=True)
+    executed_volume = Column(Double, nullable=True)
+    paid_fee = Column(Double, nullable=True)
+    raw_json = Column(JSONB, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("uuid", "ts", name="uq_upbit_order_snapshots_uuid_ts"),
+        Index("ix_upbit_order_snapshots_symbol_ts", "symbol", "ts"),
+        Index("ix_upbit_order_snapshots_uuid_ts", "uuid", "ts"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UpbitOrderSnapshot {self.uuid} state={self.state} ts={self.ts}>"
+
+
+class LivePosition(Base):
+    """실계좌 기반 포지션 스냅샷 (UpbitAccountRunner가 갱신)."""
+
+    __tablename__ = "live_positions"
+
+    symbol = Column(Text, primary_key=True)
+    ts = Column(DateTime(timezone=True), nullable=False)
+    krw_balance = Column(Double, nullable=True)
+    btc_balance = Column(Double, nullable=True)
+    btc_avg_buy_price = Column(Double, nullable=True)
+    position_status = Column(Text, nullable=True)   # FLAT | LONG
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    def __repr__(self) -> str:
+        return f"<LivePosition {self.symbol} status={self.position_status} btc={self.btc_balance}>"

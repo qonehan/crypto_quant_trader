@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     UPBIT_TRADE_MODE: str = "shadow"  # shadow | live
     LIVE_GUARD_PHRASE: str = ""  # must be "I_CONFIRM_LIVE_TRADING" to enable live
 
+    # Live order polling (Step 8)
+    LIVE_ORDER_POLL_INTERVAL_SEC: int = 5
+    LIVE_ORDER_MAX_POLLS: int = 24  # up to 120s total
+
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
 
 

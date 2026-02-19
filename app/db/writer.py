@@ -1,5 +1,16 @@
+import json
+
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+def _j(val):
+    """Serialize Python dict/list to JSON string for psycopg3 text() JSONB params."""
+    if val is None:
+        return None
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return val
 
 _UPSERT_SQL = text("""
 INSERT INTO market_1s (
@@ -144,8 +155,10 @@ ON CONFLICT ON CONSTRAINT uq_predictions_symbol_t0 DO UPDATE SET
 
 
 def upsert_prediction(engine: Engine, row: dict) -> None:
+    r = dict(row)
+    r["features"] = _j(r.get("features"))
     with engine.begin() as conn:
-        conn.execute(_UPSERT_PREDICTION_SQL, row)
+        conn.execute(_UPSERT_PREDICTION_SQL, r)
 
 
 _UPSERT_EVAL_SQL = text("""
@@ -369,18 +382,111 @@ VALUES
 _INSERT_UPBIT_ORDER_ATTEMPT = text("""
 INSERT INTO upbit_order_attempts
     (ts, symbol, action, mode, side, ord_type,
-     price, volume, paper_trade_id, response_json, status, error_msg)
+     price, volume, paper_trade_id, response_json, status, error_msg,
+     uuid, identifier, request_json, http_status, latency_ms, remaining_req,
+     retry_count, final_state, executed_volume, paid_fee, avg_price)
 VALUES
     (:ts, :symbol, :action, :mode, :side, :ord_type,
-     :price, :volume, :paper_trade_id, :response_json, :status, :error_msg)
+     :price, :volume, :paper_trade_id, :response_json, :status, :error_msg,
+     :uuid, :identifier, :request_json, :http_status, :latency_ms, :remaining_req,
+     :retry_count, :final_state, :executed_volume, :paid_fee, :avg_price)
+RETURNING id
 """)
 
 
 def insert_upbit_account_snapshot(engine: Engine, row: dict) -> None:
+    r = dict(row)
+    r["raw_json"] = _j(r.get("raw_json"))
     with engine.begin() as conn:
-        conn.execute(_INSERT_UPBIT_ACCOUNT_SNAPSHOT, row)
+        conn.execute(_INSERT_UPBIT_ACCOUNT_SNAPSHOT, r)
 
 
-def insert_upbit_order_attempt(engine: Engine, row: dict) -> None:
+def insert_upbit_order_attempt(engine: Engine, row: dict) -> int | None:
+    """Insert an order attempt row and return its generated id."""
+    defaults = {
+        "uuid": None,
+        "identifier": None,
+        "request_json": None,
+        "http_status": None,
+        "latency_ms": None,
+        "remaining_req": None,
+        "retry_count": 0,
+        "final_state": None,
+        "executed_volume": None,
+        "paid_fee": None,
+        "avg_price": None,
+    }
+    merged = {**defaults, **row}
+    # Serialize JSONB fields for psycopg3 text() queries
+    merged["response_json"] = _j(merged.get("response_json"))
+    merged["request_json"] = _j(merged.get("request_json"))
     with engine.begin() as conn:
-        conn.execute(_INSERT_UPBIT_ORDER_ATTEMPT, row)
+        result = conn.execute(_INSERT_UPBIT_ORDER_ATTEMPT, merged)
+        row_res = result.fetchone()
+        return row_res[0] if row_res else None
+
+
+_UPDATE_ORDER_ATTEMPT_FINAL = text("""
+UPDATE upbit_order_attempts
+SET final_state = :final_state,
+    executed_volume = :executed_volume,
+    paid_fee = :paid_fee,
+    avg_price = :avg_price
+WHERE id = :attempt_id
+""")
+
+
+def update_upbit_order_attempt_final(
+    engine: Engine,
+    attempt_id: int,
+    final_state: str,
+    executed_volume: float | None = None,
+    paid_fee: float | None = None,
+    avg_price: float | None = None,
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(_UPDATE_ORDER_ATTEMPT_FINAL, {
+            "attempt_id": attempt_id,
+            "final_state": final_state,
+            "executed_volume": executed_volume,
+            "paid_fee": paid_fee,
+            "avg_price": avg_price,
+        })
+
+
+_INSERT_UPBIT_ORDER_SNAPSHOT = text("""
+INSERT INTO upbit_order_snapshots
+    (ts, symbol, uuid, state, side, ord_type, price, volume,
+     remaining_volume, executed_volume, paid_fee, raw_json)
+VALUES
+    (:ts, :symbol, :uuid, :state, :side, :ord_type, :price, :volume,
+     :remaining_volume, :executed_volume, :paid_fee, :raw_json)
+ON CONFLICT (uuid, ts) DO NOTHING
+""")
+
+
+def insert_upbit_order_snapshot(engine: Engine, row: dict) -> None:
+    r = dict(row)
+    r["raw_json"] = _j(r.get("raw_json"))
+    with engine.begin() as conn:
+        conn.execute(_INSERT_UPBIT_ORDER_SNAPSHOT, r)
+
+
+_UPSERT_LIVE_POSITION = text("""
+INSERT INTO live_positions
+    (symbol, ts, krw_balance, btc_balance, btc_avg_buy_price, position_status, updated_at)
+VALUES
+    (:symbol, :ts, :krw_balance, :btc_balance, :btc_avg_buy_price, :position_status, now())
+ON CONFLICT (symbol) DO UPDATE SET
+    ts = EXCLUDED.ts,
+    krw_balance = EXCLUDED.krw_balance,
+    btc_balance = EXCLUDED.btc_balance,
+    btc_avg_buy_price = EXCLUDED.btc_avg_buy_price,
+    position_status = EXCLUDED.position_status,
+    updated_at = now()
+""")
+
+
+def upsert_live_position(engine: Engine, row: dict) -> None:
+    with engine.begin() as conn:
+        conn.execute(_UPSERT_LIVE_POSITION, row)
