@@ -1,9 +1,9 @@
-# Step ALT-3 리뷰 & 병합 작업 보고서
+# Step ALT-3 리뷰 작업 보고서
 
 > **작업일시**: 2026-02-22  
 > **브랜치**: `copilot/force-actual-data-collection` → `copilot/review-alt-3-changes` (main 병합 대상)  
-> **목적**: ALT-3 변경사항(Coinglass 실수집 강제 / Export 라벨 누수 방지 / 원클릭 점검) 리뷰 후 main 반영  
-> **상태**: ✅ 리뷰 완료 — PR #2 머지 후 브랜치 삭제 필요
+> **목적**: ALT-3 변경사항(Coinglass 실수집 강제 / Export 라벨 누수 방지 / 원클릭 점검) 리뷰  
+> **상태**: ✅ 리뷰 완료 — **PR #2 OPEN** (maintainer 머지 대기중)
 
 ---
 
@@ -221,74 +221,73 @@ poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 1
 
 ---
 
-## 8. main 병합 & 브랜치 정리 절차
+## 8. PR 상태 & 다음 액션
 
-### 8-1. 병합 방법
+### 8-1. PR 현황
 
-PR #2 (`copilot/review-alt-3-changes` → `main`)를 GitHub에서 Merge:
+| PR | 브랜치 | 상태 | 처리 |
+|----|--------|------|------|
+| #1 | `copilot/force-actual-data-collection` | **Open → maintainer가 Close** | 중간 산출물 — 최종본은 PR #2 |
+| #2 | `copilot/review-alt-3-changes` | **Open** | ✅ maintainer가 머지 |
 
-```
-GitHub → PR #2 → "Merge pull request" → "Confirm merge"
-```
+### 8-2. main 반영
 
-또는 CLI로:
-```bash
-git switch main
-git pull --ff-only origin main
-git merge --no-ff copilot/review-alt-3-changes -m "Merge ALT-3: enforce Coinglass + export label integrity + pipeline checks"
-git push origin main
-```
+main 병합은 **maintainer(권한 보유자)**가 PR #2를 머지하여 수행한다.
 
-### 8-2. 브랜치 삭제 (main 반영 완료 후)
+### 8-3. 브랜치 삭제 (머지 완료 후, 권한 있을 때만)
 
-```bash
-# 원격 브랜치 삭제
-git push origin --delete copilot/force-actual-data-collection
-git push origin --delete copilot/review-alt-3-changes
-
-# 로컬 브랜치 삭제
-git switch main
-git branch -D copilot/force-actual-data-collection 2>/dev/null || true
-git branch -D copilot/review-alt-3-changes 2>/dev/null || true
-
-# 확인
-git fetch --prune
-git branch -a | grep copilot || echo "OK: copilot 브랜치 모두 삭제됨"
-```
-
-### 8-3. PR 정리
-
-| PR | 브랜치 | 처리 |
-|----|--------|------|
-| #1 | `copilot/force-actual-data-collection` | Close (중간 산출물, 최종본은 #2) |
-| #2 | `copilot/review-alt-3-changes` | **Merge** → main 반영 후 브랜치 삭제 |
-
-### 8-4. 병합 후 검증
-
-```bash
-# ALT-3 커밋이 main에 존재하는지 확인
-git log --oneline --decorate -10
-
-# 원클릭 점검
-bash scripts/run_pipeline_checks.sh --window 600
-
-# Export 검증
-poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 120
-ls -lh dataset.parquet
-```
+PR #2가 머지 완료된 후 maintainer가 브랜치를 삭제한다:
+- `copilot/force-actual-data-collection` — 원격 삭제
+- `copilot/review-alt-3-changes` — 원격 삭제 (GitHub 머지 시 자동 삭제 옵션 사용 가능)
 
 ---
 
-## 9. 최종 체크리스트
+## 9. 재현/검증 (머지 전후 모두 실행 가능)
+
+### 원클릭 파이프라인 점검
+```bash
+bash scripts/run_pipeline_checks.sh --window 600
+echo "EXIT_CODE=$?"
+```
+- **기대 결과**: EXIT_CODE=0 (4개 점검 모두 PASS)
+
+### 개별 점검
+```bash
+poetry run python -m app.diagnostics.altdata_check --window 600
+poetry run python -m app.diagnostics.feature_check --window 600
+poetry run python -m app.diagnostics.feature_leak_check --window 600
+poetry run python -m app.diagnostics.coinglass_check --window 600
+```
+- **기대 결과**: 각 점검 모듈이 PASS 출력, exit 0 반환
+
+### Export 검증
+```bash
+poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 120
+ls -lh dataset.parquet
+```
+- **기대 결과**: parquet 파일 생성 (0바이트가 아닌 유효한 파일)
+
+---
+
+## 10. 리스크/주의사항
+
+- **운영 영향**: `COINGLASS_ENABLED=true` + 실제 API 키가 `.env`에 설정되어야 `coinglass_check`가 PASS
+- **롤백**: main의 `backup/pre-alt3-merge-*` 태그(생성 시)로 되돌리기 가능
+- **키/권한**: Coinglass API 키가 미설정이면 점검 FAIL — 이는 ALT-3 정책상 의도된 동작
+
+---
+
+## 11. 최종 체크리스트
 
 - [x] `copilot/review-alt-3-changes`가 ALT-3 최종본 (copilot/force-actual-data-collection + SQL injection 수정 + 보고서)
 - [x] Python 구문 검사 14개 파일 전체 PASS
 - [x] 제거 대상 참조(`is_real_key`, `feature_snapshots`, `app.features`) 잔존 0건
 - [x] SQL injection 취약 패턴 잔존 0건 (변경 파일 내)
 - [x] CodeQL 보안 스캔 0 alerts
-- [ ] PR #2 → main 머지 완료
-- [ ] PR #1 Close 처리
-- [ ] 원격 브랜치 2개 삭제 완료 (`copilot/force-actual-data-collection`, `copilot/review-alt-3-changes`)
-- [ ] 로컬 브랜치 정리 완료
-- [ ] `bash scripts/run_pipeline_checks.sh --window 600` → EXIT_CODE=0
-- [ ] `poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 120` → 파일 생성 성공
+- [x] PR #1 Close 필요 표시 (maintainer가 Close — 권한 제한으로 자동 Close 불가)
+- [x] PR #2 Open 유지 (maintainer 머지 대기)
+- [x] 보고서에 재현/검증 커맨드 포함
+- [ ] (maintainer) PR #2 → main 머지
+- [ ] (maintainer, 머지 후) copilot 브랜치 삭제
+- [ ] (머지 후) `bash scripts/run_pipeline_checks.sh --window 600` → EXIT_CODE=0
+- [ ] (머지 후) `poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 120` → 파일 생성 성공
