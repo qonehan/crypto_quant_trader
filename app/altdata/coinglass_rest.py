@@ -12,10 +12,10 @@ import time
 from datetime import datetime, timezone
 
 import httpx
-
-from app.altdata.writer import insert_coinglass_liq_map
-from app.config import Settings
 from sqlalchemy.engine import Engine
+
+from app.altdata.writer import insert_coinglass_call_status, insert_coinglass_liq_map
+from app.config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class CoinglassRestPoller:
         self._stop = False
         self.last_poll_ts: float = 0.0
         self.poll_count: int = 0
-        self.enabled: bool = bool(settings.COINGLASS_API_KEY)
+        self.enabled: bool = bool(settings.COINGLASS_ENABLED and settings.COINGLASS_API_KEY)
 
     async def run(self) -> None:
         s = self.settings
@@ -114,8 +114,10 @@ class CoinglassRestPoller:
         }
 
         for attempt in range(_MAX_RETRY):
+            t0 = time.time()
             try:
                 resp = await client.get(endpoint, params=params, timeout=15.0)
+                latency_ms = int((time.time() - t0) * 1000)
                 if resp.status_code == 200:
                     raw = resp.json()
                     summary = _build_summary(raw)
@@ -128,21 +130,43 @@ class CoinglassRestPoller:
                         summary=summary,
                         raw=raw,
                     )
+                    insert_coinglass_call_status(
+                        self.engine, symbol, ok=True,
+                        http_status=200, latency_ms=latency_ms,
+                    )
                     return
                 if resp.status_code in (429, 418):
                     wait = _RETRY_BASE * (2 ** attempt)
                     log.warning(
                         "Coinglass rate limit %d, retry in %.1fs", resp.status_code, wait
                     )
+                    insert_coinglass_call_status(
+                        self.engine, symbol, ok=False,
+                        http_status=resp.status_code,
+                        error_msg=f"rate_limit_{resp.status_code}",
+                        latency_ms=latency_ms,
+                    )
                     await asyncio.sleep(wait)
                     continue
                 log.warning(
                     "Coinglass HTTP %d body=%s", resp.status_code, resp.text[:200]
                 )
+                insert_coinglass_call_status(
+                    self.engine, symbol, ok=False,
+                    http_status=resp.status_code,
+                    error_msg=resp.text[:200],
+                    latency_ms=latency_ms,
+                )
                 return
             except Exception as exc:
+                latency_ms = int((time.time() - t0) * 1000)
                 wait = _RETRY_BASE * (2 ** attempt)
                 log.warning("Coinglass request error (%s), retry in %.1fs", exc, wait)
+                insert_coinglass_call_status(
+                    self.engine, symbol, ok=False,
+                    error_msg=str(exc)[:200],
+                    latency_ms=latency_ms,
+                )
                 await asyncio.sleep(wait)
 
     def stop(self) -> None:

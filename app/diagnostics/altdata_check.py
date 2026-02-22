@@ -209,7 +209,9 @@ def check_force_orders(conn, symbol: str) -> tuple[bool, str]:
     return True, "\n".join(lines)
 
 
-def check_coinglass(conn, symbol: str, poll_sec: int) -> tuple[bool, str]:
+def check_coinglass(
+    conn, symbol: str, poll_sec: int, coinglass_enabled: bool
+) -> tuple[bool, str]:
     lines = ["[coinglass_liquidation_map]"]
 
     rows, err = _safe_query(
@@ -219,11 +221,18 @@ def check_coinglass(conn, symbol: str, poll_sec: int) -> tuple[bool, str]:
     )
     if err or rows is None:
         lines.append(f"  SKIP/ERROR: {err}")
+        if coinglass_enabled:
+            lines.append("  → FAIL ❌ (COINGLASS_ENABLED=true, SKIP 금지)")
+            return False, "\n".join(lines)
         lines.append("  → SKIP")
-        return True, "\n".join(lines)  # optional: SKIP = PASS
+        return True, "\n".join(lines)
 
     max_ts = rows[0][0]
     if max_ts is None:
+        if coinglass_enabled:
+            lines.append("  max_ts = None (데이터 없음)")
+            lines.append("  → FAIL ❌ (COINGLASS_ENABLED=true, 데이터 필수)")
+            return False, "\n".join(lines)
         lines.append("  max_ts = None (no data yet — COINGLASS_API_KEY 미설정이면 정상)")
         lines.append("  → SKIP ✅")
         return True, "\n".join(lines)
@@ -266,6 +275,7 @@ def main() -> int:
     symbol_coinglass = s.ALT_SYMBOL_COINGLASS
     poll_sec = s.BINANCE_POLL_SEC
     cg_poll_sec = s.COINGLASS_POLL_SEC
+    cg_enabled = s.COINGLASS_ENABLED
 
     engine = create_engine(s.DB_URL)
 
@@ -280,6 +290,7 @@ def main() -> int:
     print(f"  BINANCE_POLL_SEC = {poll_sec}s")
     print(f"  COINGLASS_POLL_SEC = {cg_poll_sec}s")
     print(f"  COINGLASS_KEY_SET  = {bool(s.COINGLASS_API_KEY)}")
+    print(f"  COINGLASS_ENABLED  = {cg_enabled}")
     print(sep)
 
     results: dict[str, bool] = {}
@@ -300,13 +311,16 @@ def main() -> int:
         print(out)
         print()
 
-        ok, out = check_coinglass(conn, symbol_coinglass, cg_poll_sec)
-        results["coinglass"] = ok  # SKIP = PASS
+        ok, out = check_coinglass(conn, symbol_coinglass, cg_poll_sec, cg_enabled)
+        results["coinglass"] = ok
         print(out)
         print()
 
-    # OVERALL 판정 (mark_price + futures_metrics는 필수, 나머지는 optional)
+    # OVERALL 판정 (mark_price + futures_metrics는 필수)
+    # coinglass는 COINGLASS_ENABLED=true일 때 필수
     core_keys = ["mark_price", "futures_metrics"]
+    if cg_enabled:
+        core_keys.append("coinglass")
     overall_ok = all(results.get(k, False) for k in core_keys)
 
     print(sep)

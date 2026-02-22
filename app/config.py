@@ -131,6 +131,7 @@ class Settings(BaseSettings):
     BINANCE_METRIC_PERIOD: str = "5m"
 
     # Coinglass
+    COINGLASS_ENABLED: bool = False
     COINGLASS_API_KEY: str = ""
     COINGLASS_BASE: str = "https://open-api.coinglass.com"
     COINGLASS_POLL_SEC: int = 300

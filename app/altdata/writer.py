@@ -177,3 +177,37 @@ def insert_coinglass_liq_map(
             )
     except Exception:
         log.exception("insert_coinglass_liq_map error")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# coinglass_call_status
+# ──────────────────────────────────────────────────────────────────────────────
+
+def insert_coinglass_call_status(
+    engine: Engine,
+    symbol: str,
+    ok: bool,
+    http_status: int | None = None,
+    error_msg: str | None = None,
+    latency_ms: int | None = None,
+) -> None:
+    """Record Coinglass API call result for diagnostics."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO coinglass_call_status
+                        (ts, symbol, ok, http_status, error_msg, latency_ms)
+                    VALUES
+                        (now(), :symbol, :ok, :http_status, :error_msg, :latency_ms)
+                """),
+                {
+                    "symbol": symbol,
+                    "ok": ok,
+                    "http_status": http_status,
+                    "error_msg": error_msg,
+                    "latency_ms": latency_ms,
+                },
+            )
+    except Exception:
+        log.exception("insert_coinglass_call_status error")

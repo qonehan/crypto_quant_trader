@@ -399,4 +399,22 @@ def apply_migrations(engine: Engine) -> None:
         """))
         log.info("Applied: coinglass_liquidation_map (CREATE IF NOT EXISTS)")
 
+        # (ALT-5) coinglass_call_status
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS coinglass_call_status (
+                id          BIGSERIAL PRIMARY KEY,
+                ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+                symbol      TEXT NOT NULL,
+                ok          BOOLEAN NOT NULL,
+                http_status INTEGER,
+                error_msg   TEXT,
+                latency_ms  INTEGER
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_coinglass_call_status_symbol_ts
+            ON coinglass_call_status (symbol, ts DESC)
+        """))
+        log.info("Applied: coinglass_call_status (CREATE IF NOT EXISTS)")
+
     log.info("All migrations complete (v1 + Step 7-11 + Step ALT)")
