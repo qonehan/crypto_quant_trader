@@ -1,8 +1,5 @@
 """
-coinglass_check.py — Coinglass 수집 상태 점검
-
-COINGLASS_ENABLED=False(기본) 이면 SKIP PASS.
-COINGLASS_ENABLED=True 이면 키 + 데이터 + lag 모두 체크.
+coinglass_check.py — Coinglass 수집 강제 점검 (PASS/FAIL, SKIP 금지)
 
 사용법:
   poetry run python -m app.diagnostics.coinglass_check
@@ -17,7 +14,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, text
 
-from app.config import is_real_key, load_settings
+from app.config import load_settings
 
 
 def _now() -> datetime:
@@ -29,7 +26,18 @@ def _lag(ts) -> float | None:
         return None
     if hasattr(ts, "tzinfo") and ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return max(0.0, (_now() - ts).total_seconds())
+    return (_now() - ts).total_seconds()
+
+
+def _lag_badge(lag: float | None, warn_sec: float = 60.0, fail_sec: float = 600.0) -> str:
+    if lag is None:
+        return "N/A"
+    if lag <= warn_sec:
+        return f"{lag:.1f}s ✅"
+    elif lag <= fail_sec:
+        return f"{lag:.1f}s ⚠️"
+    else:
+        return f"{lag:.1f}s ❌"
 
 
 def _safe_query(conn, sql: str, params: dict | None = None):
@@ -44,149 +52,133 @@ def _safe_query(conn, sql: str, params: dict | None = None):
         return None, str(e)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 체크 함수
-# ──────────────────────────────────────────────────────────────────────────────
+def _fmt_row(row) -> str:
+    try:
+        d = dict(row._mapping)
+        return "  " + ", ".join(f"{k}={v}" for k, v in d.items())
+    except Exception:
+        return "  " + str(row)
 
 
-def check_coinglass_collection(
-    conn, symbol: str, window_sec: int, cg_enabled: bool, key_is_real: bool
-) -> tuple[bool, str]:
-    lines = ["[coinglass_collection]"]
-
-    if not cg_enabled:
-        lines.append("  COINGLASS_ENABLED=False → SKIP ✅")
-        return True, "\n".join(lines)
-
-    if not key_is_real:
-        lines.append("  COINGLASS_ENABLED=True 이나 API 키 비정상 — 설정 오류 ❌")
-        lines.append("  → FAIL ❌ (.env에서 COINGLASS_API_KEY를 실제 키로 교체 필요)")
-        return False, "\n".join(lines)
-
-    # 데이터 있는지 확인
-    rows, err = _safe_query(
-        conn,
-        "SELECT max(ts) AS max_ts, count(*) AS cnt FROM coinglass_liquidation_map WHERE symbol=:sym",
-        {"sym": symbol},
-    )
-    if err or rows is None:
-        lines.append(f"  ERROR: {err}")
-        return False, "\n".join(lines)
-
-    max_ts, total_cnt = rows[0]
-    lag = _lag(max_ts)
-    lines.append(f"  max(ts)   = {max_ts}")
-    lines.append(f"  total cnt = {total_cnt}")
-
-    # window 내 count
-    rows2, _ = _safe_query(
-        conn,
-        f"""
-        SELECT count(*) AS cnt
-        FROM coinglass_liquidation_map
-        WHERE symbol = :sym
-          AND ts >= now() AT TIME ZONE 'UTC' - interval '{window_sec} seconds'
-        """,
-        {"sym": symbol},
-    )
-    window_cnt = rows2[0][0] if rows2 else 0
-    lines.append(f"  count(window={window_sec}s) = {window_cnt}")
-
-    if lag is None or lag > window_sec:
-        lines.append(f"  lag={lag}s > window={window_sec}s → FAIL ❌")
-        return False, "\n".join(lines)
-    if window_cnt < 1:
-        lines.append(f"  window 내 데이터 없음 → FAIL ❌")
-        return False, "\n".join(lines)
-
-    lines.append(f"  lag={lag:.0f}s ✅  window_count={window_cnt} ≥ 1 ✅")
-    lines.append("  → PASS ✅")
-    return True, "\n".join(lines)
-
-
-def check_call_status(conn, window_sec: int) -> tuple[bool, str]:
-    """coinglass_call_status 테이블에서 최근 성공/실패 이력."""
+def check_call_status(conn, symbol: str, window_sec: int) -> tuple[bool, str]:
+    """Check coinglass_call_status table for ok=true within window."""
     lines = ["[coinglass_call_status]"]
 
     rows, err = _safe_query(
         conn,
-        """
-        SELECT ok, ts, http_status, error_msg, latency_ms
-        FROM coinglass_call_status
-        ORDER BY ts DESC LIMIT 1
-        """,
+        """SELECT count(*) as ok_cnt FROM coinglass_call_status
+           WHERE symbol=:sym AND ok=true
+             AND ts >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
-    if err:
-        lines.append(f"  coinglass_call_status not available: {err}")
-        lines.append("  → SKIP (테이블 없음)")
-        return True, "\n".join(lines)
-    if not rows:
-        lines.append("  no call records yet")
-        lines.append("  → SKIP")
-        return True, "\n".join(lines)
+    if err or rows is None:
+        lines.append(f"  ERROR: {err}")
+        lines.append("  → FAIL ❌")
+        return False, "\n".join(lines)
 
-    last = rows[0]
-    lines.append(f"  last call: ok={last[0]} ts={last[1]} http={last[2]} latency={last[4]}ms")
-    if last[3]:
-        lines.append(f"  last error: {last[3][:200]}")
+    ok_cnt = rows[0][0]
+    lines.append(f"  ok=true count (last {window_sec}s) = {ok_cnt}")
 
-    # 24h success count
     rows2, _ = _safe_query(
         conn,
-        "SELECT count(*) FROM coinglass_call_status WHERE ok=true AND ts >= now() - interval '24 hours'",
+        """SELECT ts, ok, http_status, error_msg, latency_ms
+           FROM coinglass_call_status
+           WHERE symbol=:sym ORDER BY ts DESC LIMIT 5""",
+        {"sym": symbol},
     )
-    ok_24h = rows2[0][0] if rows2 else 0
-    rows3, _ = _safe_query(
+    if rows2:
+        lines.append("  last 5 rows:")
+        for r in rows2:
+            lines.append(_fmt_row(r))
+
+    ok = ok_cnt >= 1
+    lines.append(f"  → {'PASS ✅' if ok else 'FAIL ❌'}")
+    return ok, "\n".join(lines)
+
+
+def check_liq_map(conn, symbol: str, window_sec: int) -> tuple[bool, str]:
+    """Check coinglass_liquidation_map has at least 1 row within window."""
+    lines = ["[coinglass_liquidation_map]"]
+
+    rows, err = _safe_query(
         conn,
-        "SELECT count(*) FROM coinglass_call_status WHERE ts >= now() - interval '24 hours'",
+        """SELECT count(*) as cnt FROM coinglass_liquidation_map
+           WHERE symbol=:sym
+             AND ts >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
-    total_24h = rows3[0][0] if rows3 else 0
-    lines.append(f"  24h: {ok_24h}/{total_24h} success")
-    lines.append("  → INFO (call_status 정보성)")
-    return True, "\n".join(lines)
+    if err or rows is None:
+        lines.append(f"  ERROR: {err}")
+        lines.append("  → FAIL ❌")
+        return False, "\n".join(lines)
 
+    cnt = rows[0][0]
+    lines.append(f"  row count (last {window_sec}s) = {cnt}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# main
-# ──────────────────────────────────────────────────────────────────────────────
+    rows2, _ = _safe_query(
+        conn,
+        """SELECT ts, symbol, exchange, timeframe
+           FROM coinglass_liquidation_map
+           WHERE symbol=:sym ORDER BY ts DESC LIMIT 3""",
+        {"sym": symbol},
+    )
+    if rows2:
+        lines.append("  last 3 rows:")
+        for r in rows2:
+            lines.append(_fmt_row(r))
+
+    ok = cnt >= 1
+    lines.append(f"  → {'PASS ✅' if ok else 'FAIL ❌'}")
+    return ok, "\n".join(lines)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Coinglass 수집 상태 점검")
+    parser = argparse.ArgumentParser(description="Coinglass 수집 강제 점검 (PASS/FAIL)")
     parser.add_argument("--window", type=int, default=600, help="점검 윈도우(초, 기본 600)")
     args = parser.parse_args()
     window_sec = args.window
 
     s = load_settings()
     symbol = s.ALT_SYMBOL_COINGLASS
-    cg_enabled = getattr(s, "COINGLASS_ENABLED", False)
-    key_is_real = is_real_key(s.COINGLASS_API_KEY)
+
+    # COINGLASS_ENABLED=false이면 FAIL
+    if not s.COINGLASS_ENABLED:
+        print("=" * 60)
+        print("  Coinglass 수집 강제 점검")
+        print("  COINGLASS_ENABLED = false → FAIL ❌")
+        print("  (SKIP PASS 금지: COINGLASS_ENABLED=true 설정 필요)")
+        print("=" * 60)
+        return 1
+
+    if not s.COINGLASS_API_KEY:
+        print("=" * 60)
+        print("  Coinglass 수집 강제 점검")
+        print("  COINGLASS_API_KEY 미설정 → FAIL ❌")
+        print("  (SKIP PASS 금지: API 키 설정 필요)")
+        print("=" * 60)
+        return 1
 
     engine = create_engine(s.DB_URL)
-
-    now = _now()
     sep = "=" * 60
+
     print(sep)
-    print("  Coinglass 수집 상태 점검")
-    print(f"  now_utc            = {now.isoformat()}")
-    print(f"  coinglass_symbol   = {symbol}")
-    print(f"  window             = {window_sec}s")
-    print(f"  COINGLASS_ENABLED  = {cg_enabled}")
-    print(f"  COINGLASS_KEY_REAL = {key_is_real}")
+    print("  Coinglass 수집 강제 점검 (PASS/FAIL)")
+    print(f"  symbol       = {symbol}")
+    print(f"  window       = {window_sec}s")
+    print(f"  COINGLASS_ENABLED  = {s.COINGLASS_ENABLED}")
+    print(f"  COINGLASS_KEY_SET  = {bool(s.COINGLASS_API_KEY)}")
     print(sep)
 
     results: dict[str, bool] = {}
 
     with engine.connect() as conn:
-        ok, out = check_coinglass_collection(
-            conn, symbol, window_sec, cg_enabled, key_is_real
-        )
-        results["collection"] = ok
+        ok, out = check_call_status(conn, symbol, window_sec)
+        results["call_status"] = ok
         print(out)
         print()
 
-        ok, out = check_call_status(conn, window_sec)
-        results["call_status"] = ok
+        ok, out = check_liq_map(conn, symbol, window_sec)
+        results["liq_map"] = ok
         print(out)
         print()
 
@@ -195,11 +187,9 @@ def main() -> int:
     print(sep)
     print("  개별 결과:")
     for k, v in results.items():
-        print(f"    {k:20s}: {'PASS ✅' if v else 'FAIL ❌'}")
+        print(f"    {k:30s}: {'PASS ✅' if v else 'FAIL ❌'}")
     print()
     print(f"  OVERALL: {'PASS ✅' if overall_ok else 'FAIL ❌'}")
-    if not cg_enabled:
-        print("  ※ COINGLASS_ENABLED=False → SKIP PASS (수집 비활성 상태)")
     print(sep)
 
     return 0 if overall_ok else 1
