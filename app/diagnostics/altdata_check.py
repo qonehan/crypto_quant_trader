@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, text
 
-from app.config import load_settings
+from app.config import is_real_key, load_settings
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 유틸리티
@@ -30,7 +30,8 @@ def _lag(ts) -> float | None:
         return None
     if hasattr(ts, "tzinfo") and ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return (_now() - ts).total_seconds()
+    raw = (_now() - ts).total_seconds()
+    return max(0.0, raw)
 
 
 def _safe_query(conn, sql: str, params: dict | None = None):
@@ -209,7 +210,11 @@ def check_force_orders(conn, symbol: str) -> tuple[bool, str]:
     return True, "\n".join(lines)
 
 
-def check_coinglass(conn, symbol: str, poll_sec: int) -> tuple[bool, str]:
+def check_coinglass(
+    conn, symbol: str, poll_sec: int,
+    key_is_real: bool = False,
+    cg_enabled: bool = False,
+) -> tuple[bool, str]:
     lines = ["[coinglass_liquidation_map]"]
 
     rows, err = _safe_query(
@@ -220,13 +225,22 @@ def check_coinglass(conn, symbol: str, poll_sec: int) -> tuple[bool, str]:
     if err or rows is None:
         lines.append(f"  SKIP/ERROR: {err}")
         lines.append("  → SKIP")
-        return True, "\n".join(lines)  # optional: SKIP = PASS
+        return True, "\n".join(lines)  # table error = SKIP
 
     max_ts = rows[0][0]
     if max_ts is None:
-        lines.append("  max_ts = None (no data yet — COINGLASS_API_KEY 미설정이면 정상)")
-        lines.append("  → SKIP ✅")
-        return True, "\n".join(lines)
+        if cg_enabled and not key_is_real:
+            lines.append("  COINGLASS_ENABLED=True 이나 API 키 비정상 — 설정 오류")
+            lines.append("  → FAIL ❌ (설정 오류: COINGLASS_API_KEY에 실제 키 필요)")
+            return False, "\n".join(lines)
+        elif cg_enabled and key_is_real:
+            lines.append("  max_ts = None (키 설정됨, 아직 데이터 없음 — 첫 poll 대기)")
+            lines.append("  → FAIL ❌ (키 설정됨 → 데이터 없으면 파이프라인 오류)")
+            return False, "\n".join(lines)
+        else:
+            lines.append("  max_ts = None (COINGLASS_ENABLED=False → 수집 SKIP)")
+            lines.append("  → SKIP ✅ (COINGLASS_ENABLED=False — 정상)")
+            return True, "\n".join(lines)
 
     lag = _lag(max_ts)
     threshold = poll_sec * 2 + 60
@@ -279,7 +293,10 @@ def main() -> int:
     print(f"  window           = {window_sec}s")
     print(f"  BINANCE_POLL_SEC = {poll_sec}s")
     print(f"  COINGLASS_POLL_SEC = {cg_poll_sec}s")
-    print(f"  COINGLASS_KEY_SET  = {bool(s.COINGLASS_API_KEY)}")
+    cg_key_real = is_real_key(s.COINGLASS_API_KEY)
+    cg_enabled = getattr(s, "COINGLASS_ENABLED", False)
+    print(f"  COINGLASS_ENABLED  = {cg_enabled}")
+    print(f"  COINGLASS_KEY_SET  = {cg_key_real} (is_real_key 판정)")
     print(sep)
 
     results: dict[str, bool] = {}
@@ -300,7 +317,10 @@ def main() -> int:
         print(out)
         print()
 
-        ok, out = check_coinglass(conn, symbol_coinglass, cg_poll_sec)
+        ok, out = check_coinglass(
+            conn, symbol_coinglass, cg_poll_sec,
+            key_is_real=cg_key_real, cg_enabled=cg_enabled,
+        )
         results["coinglass"] = ok  # SKIP = PASS
         print(out)
         print()

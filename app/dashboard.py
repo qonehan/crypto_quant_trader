@@ -13,7 +13,7 @@ import pandas as pd
 from datetime import datetime, timezone
 from sqlalchemy import text
 
-from app.config import load_settings
+from app.config import is_real_key, load_settings
 from app.db.session import get_engine
 from app.evaluator.evaluator import compute_calibration
 
@@ -1017,8 +1017,48 @@ def main() -> None:
 
     # ── G3: Coinglass ─────────────────────────────────────────
     st.subheader("G3 — Coinglass Liquidation Map")
-    cg_key_set = bool(settings.COINGLASS_API_KEY)
-    st.caption(f"COINGLASS_API_KEY: {'✅ 설정됨' if cg_key_set else '❌ 미설정 (수집 SKIP)'}")
+    cg_key_set = is_real_key(settings.COINGLASS_API_KEY)
+    cg_enabled = getattr(settings, "COINGLASS_ENABLED", False)
+
+    # 상태 배너
+    if cg_enabled and not cg_key_set:
+        st.error("❌ 설정 오류: COINGLASS_ENABLED=True 이나 API 키 비정상 — .env에서 실제 키 입력 필요")
+    elif cg_enabled and cg_key_set:
+        st.success("✅ Coinglass 활성 (COINGLASS_ENABLED=True, 키 설정됨)")
+    else:
+        st.info(f"COINGLASS_API_KEY: {'✅ 실키 설정됨' if cg_key_set else '❌ 미설정/비정상'}  |  COINGLASS_ENABLED=False → SKIP")
+
+    # call_status 패널
+    try:
+        with engine.connect() as conn:
+            cgs_last = conn.execute(
+                text("""
+                    SELECT ok, ts, http_status, error_msg, latency_ms, poll_count
+                    FROM coinglass_call_status
+                    ORDER BY ts DESC LIMIT 1
+                """)
+            ).fetchone()
+            cgs_ok24 = conn.execute(
+                text("""
+                    SELECT
+                        count(*) FILTER (WHERE ok=true) AS ok_cnt,
+                        count(*) AS total
+                    FROM coinglass_call_status
+                    WHERE ts >= now() - interval '24 hours'
+                """)
+            ).fetchone()
+    except Exception:
+        cgs_last = None
+        cgs_ok24 = None
+
+    if cgs_last:
+        ca, cb, cc = st.columns(3)
+        ca.metric("Last Call OK", "✅ YES" if cgs_last.ok else "❌ NO")
+        cb.metric("Last Call TS", str(cgs_last.ts)[:19] if cgs_last.ts else "N/A")
+        cc.metric("24h Success", f"{cgs_ok24.ok_cnt}/{cgs_ok24.total}" if cgs_ok24 else "N/A")
+        if not cgs_last.ok and cgs_last.error_msg:
+            st.caption(f"마지막 실패 원인: http={cgs_last.http_status} {cgs_last.error_msg[:150]}")
+
     try:
         with engine.connect() as conn:
             cg_df = pd.read_sql_query(
@@ -1038,14 +1078,194 @@ def main() -> None:
     if not cg_df.empty:
         cg_last = cg_df.iloc[0]
         cg_ts = pd.to_datetime(cg_last["ts"], utc=True)
-        cg_lag = (now_utc - cg_ts).total_seconds()
+        cg_lag = max(0.0, (now_utc - cg_ts).total_seconds())
         st.metric("Last Poll", str(cg_ts)[:19], delta=f"lag={cg_lag:.0f}s")
         st.dataframe(cg_df, use_container_width=True, height=200)
     else:
-        if cg_key_set:
-            st.info("Coinglass 데이터 없음 (첫 poll 대기)")
+        if cg_enabled and cg_key_set:
+            st.info("Coinglass 데이터 없음 (첫 poll 대기 중)")
         else:
-            st.info("COINGLASS_API_KEY 미설정 — 수집을 원하면 .env에 키를 추가하세요.")
+            st.info("COINGLASS_ENABLED=False 또는 키 미설정 — 수집하려면 .env에서 설정 필요")
+
+
+    # ══════════════════════════════════════════════════════════
+    # [G4] Feature Snapshots
+    # ══════════════════════════════════════════════════════════
+    st.subheader("G4 — Feature Snapshots (학습/모델 입력용)")
+
+    fs_sym = settings.SYMBOL
+    interval_sec = settings.DECISION_INTERVAL_SEC
+
+    # (1) Metrics: lag, fill_rate, null_rates
+    try:
+        with engine.connect() as conn:
+            fs_meta = conn.execute(
+                text("""
+                    SELECT max(ts) AS last_ts,
+                           count(*) FILTER (
+                               WHERE ts >= now() AT TIME ZONE 'UTC' - interval '300 seconds'
+                           ) AS cnt_5min,
+                           count(*) FILTER (
+                               WHERE mid_krw IS NULL
+                                 AND ts >= now() AT TIME ZONE 'UTC' - interval '300 seconds'
+                           ) AS null_mid,
+                           count(*) FILTER (
+                               WHERE p_none IS NULL
+                                 AND ts >= now() AT TIME ZONE 'UTC' - interval '300 seconds'
+                           ) AS null_p_none,
+                           count(*) FILTER (
+                               WHERE bin_funding_rate IS NULL
+                                 AND ts >= now() AT TIME ZONE 'UTC' - interval '300 seconds'
+                           ) AS null_funding,
+                           count(*) FILTER (
+                               WHERE oi_value IS NULL
+                                 AND ts >= now() AT TIME ZONE 'UTC' - interval '300 seconds'
+                           ) AS null_oi
+                    FROM feature_snapshots
+                    WHERE symbol = :sym
+                """),
+                {"sym": fs_sym},
+            ).fetchone()
+    except Exception as e:
+        st.warning(f"feature_snapshots not available: {e}")
+        fs_meta = None
+
+    if fs_meta is not None:
+        last_ts_fs = fs_meta.last_ts
+        cnt_5min = fs_meta.cnt_5min or 0
+        expected_5min = 300 // interval_sec  # e.g. 60
+        fill_5m = cnt_5min / expected_5min if expected_5min > 0 else 0.0
+
+        if last_ts_fs is not None:
+            if last_ts_fs.tzinfo is None:
+                last_ts_fs = last_ts_fs.replace(tzinfo=__import__("datetime").timezone.utc)
+            lag_fs = max(0.0, (now_utc - last_ts_fs).total_seconds())
+        else:
+            lag_fs = None
+
+        total_5m = cnt_5min or 1
+        null_mid = (fs_meta.null_mid or 0) / total_5m
+        null_p = (fs_meta.null_p_none or 0) / total_5m
+        null_fund = (fs_meta.null_funding or 0) / total_5m
+        null_oi = (fs_meta.null_oi or 0) / total_5m
+
+        g4c1, g4c2, g4c3, g4c4 = st.columns(4)
+        g4c1.metric("Last TS", str(last_ts_fs)[:19] if last_ts_fs else "N/A")
+        g4c2.metric("Lag (sec)", f"{lag_fs:.1f}" if lag_fs is not None else "N/A")
+        g4c3.metric("Fill Rate 5min", f"{fill_5m*100:.1f}% ({cnt_5min}/{expected_5min})")
+        g4c4.metric("null mid_krw", f"{null_mid*100:.1f}%")
+
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("null p_none", f"{null_p*100:.1f}%")
+        n2.metric("null bin_funding_rate", f"{null_fund*100:.1f}%")
+        n3.metric("null oi_value", f"{null_oi*100:.1f}%")
+
+        # source_ts 누수/신선도 지표
+        st.subheader("G4 — Source TS 누수/신선도 지표")
+        try:
+            with engine.connect() as conn:
+                leak_row = conn.execute(
+                    text("""
+                        SELECT
+                            count(*) FILTER (WHERE bin_mark_ts IS NOT NULL AND bin_mark_ts > ts) AS mark_leaks,
+                            count(*) FILTER (WHERE oi_ts IS NOT NULL AND oi_ts > ts) AS oi_leaks,
+                            count(*) FILTER (WHERE liq_last_ts IS NOT NULL AND liq_last_ts > ts) AS liq_leaks,
+                            avg(EXTRACT(EPOCH FROM (ts - bin_mark_ts))) FILTER (WHERE bin_mark_ts IS NOT NULL) AS avg_mark_age_sec,
+                            avg(EXTRACT(EPOCH FROM (ts - oi_ts))) FILTER (WHERE oi_ts IS NOT NULL) AS avg_oi_age_sec
+                        FROM feature_snapshots
+                        WHERE symbol = :sym
+                          AND ts >= now() AT TIME ZONE 'UTC' - interval '300 seconds'
+                    """),
+                    {"sym": fs_sym},
+                ).fetchone()
+        except Exception as e:
+            leak_row = None
+            st.warning(f"source_ts 지표 조회 오류: {e}")
+
+        if leak_row:
+            total_leaks = (leak_row.mark_leaks or 0) + (leak_row.oi_leaks or 0) + (leak_row.liq_leaks or 0)
+            if total_leaks > 0:
+                st.error(f"❌ 누수 위반 {total_leaks}건! mark={leak_row.mark_leaks} oi={leak_row.oi_leaks} liq={leak_row.liq_leaks}")
+            else:
+                st.success("✅ 누수 위반 없음 (source_ts <= snapshot_ts)")
+            l1, l2 = st.columns(2)
+            l1.metric("avg bin_mark_age (sec)", f"{leak_row.avg_mark_age_sec:.1f}" if leak_row.avg_mark_age_sec is not None else "N/A")
+            l2.metric("avg oi_age (sec)", f"{leak_row.avg_oi_age_sec:.1f}" if leak_row.avg_oi_age_sec is not None else "N/A")
+    else:
+        st.info("feature_snapshots 데이터 없음 (bot 실행 후 대기)")
+
+    # (2) Charts: 최근 6h 시계열
+    st.subheader("G4 Charts — 최근 6h")
+    try:
+        with engine.connect() as conn:
+            fs_chart_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, bin_funding_rate, oi_value, liq_5m_notional, ev_rate
+                    FROM feature_snapshots
+                    WHERE symbol = :sym
+                      AND ts >= now() AT TIME ZONE 'UTC' - interval '21600 seconds'
+                    ORDER BY ts ASC
+                """),
+                conn,
+                params={"sym": fs_sym},
+            )
+    except Exception as e:
+        st.warning(f"feature_snapshots chart data not available: {e}")
+        fs_chart_df = pd.DataFrame()
+
+    if not fs_chart_df.empty:
+        fs_chart_df = fs_chart_df.set_index("ts")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.caption("bin_funding_rate")
+            if fs_chart_df["bin_funding_rate"].notna().any():
+                st.line_chart(fs_chart_df["bin_funding_rate"].dropna())
+            else:
+                st.info("funding_rate 데이터 없음")
+            st.caption("oi_value (open interest)")
+            if fs_chart_df["oi_value"].notna().any():
+                st.line_chart(fs_chart_df["oi_value"].dropna())
+            else:
+                st.info("oi_value 데이터 없음")
+        with col_b:
+            st.caption("liq_5m_notional (5분 청산)")
+            if fs_chart_df["liq_5m_notional"].notna().any():
+                st.line_chart(fs_chart_df["liq_5m_notional"].dropna())
+            else:
+                st.info("liq_5m_notional 데이터 없음")
+            st.caption("ev_rate (기대 수익률)")
+            if fs_chart_df["ev_rate"].notna().any():
+                st.line_chart(fs_chart_df["ev_rate"].dropna())
+            else:
+                st.info("ev_rate 데이터 없음")
+    else:
+        st.info("6h 차트 데이터 없음 (bot 실행 후 대기)")
+
+    # (3) Table: 최근 50행
+    st.subheader("G4 Table — 최근 50행")
+    try:
+        with engine.connect() as conn:
+            fs_df = pd.read_sql_query(
+                text("""
+                    SELECT ts, p_none, ev_rate, action_hat,
+                           bin_mark_price, bin_funding_rate,
+                           oi_value, liq_5m_notional,
+                           mid_krw, spread_bps, barrier_status
+                    FROM feature_snapshots
+                    WHERE symbol = :sym
+                    ORDER BY ts DESC LIMIT 50
+                """),
+                conn,
+                params={"sym": fs_sym},
+            )
+    except Exception as e:
+        st.warning(f"feature_snapshots table not available: {e}")
+        fs_df = pd.DataFrame()
+
+    if not fs_df.empty:
+        st.dataframe(fs_df, use_container_width=True, height=400)
+    else:
+        st.info("feature_snapshots 데이터 없음")
 
 
 if __name__ == "__main__":

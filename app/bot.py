@@ -6,7 +6,7 @@ import logging
 from sqlalchemy import text
 
 from app.barrier.controller import BarrierController
-from app.config import load_settings
+from app.config import is_real_key, load_settings
 from app.db.init_db import ensure_schema
 from app.db.migrate import apply_migrations
 from app.db.session import get_engine
@@ -147,8 +147,8 @@ async def async_main() -> None:
         coinglass_runner = CoinglassAltDataRunner(settings, engine)
         tasks.append(asyncio.create_task(coinglass_runner.run(), name="coinglass_alt_data"))
         log.info(
-            "CoinglassAltDataRunner enabled (key_set=%s poll_sec=%d)",
-            bool(settings.COINGLASS_API_KEY),
+            "CoinglassAltDataRunner enabled (key_real=%s poll_sec=%d)",
+            is_real_key(settings.COINGLASS_API_KEY),
             settings.COINGLASS_POLL_SEC,
         )
 

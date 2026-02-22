@@ -1,6 +1,18 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def is_real_key(v: str | None) -> bool:
+    """Returns True only if the value looks like a real API key (not empty/placeholder)."""
+    if not v:
+        return False
+    vv = v.strip()
+    if not vv:
+        return False
+    if vv.lower() in {"your_key_here", "change_me", "replace_me", "__put_real_key_here__"}:
+        return False
+    return len(vv) >= 12
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -129,11 +141,14 @@ class Settings(BaseSettings):
     BINANCE_FORCE_ORDER_STREAM: str = "!forceOrder@arr"
     BINANCE_POLL_SEC: int = 60
     BINANCE_METRIC_PERIOD: str = "5m"
+    BINANCE_METRICS_FRESH_SEC: int = 180  # max(2*BINANCE_POLL_SEC, 180)
 
     # Coinglass
     COINGLASS_API_KEY: str = ""
     COINGLASS_BASE: str = "https://open-api.coinglass.com"
     COINGLASS_POLL_SEC: int = 300
+    # True 시 is_real_key() 검사 강제 — False(기본)면 SKIP 허용
+    COINGLASS_ENABLED: bool = False
 
 
 def load_settings() -> Settings:
