@@ -128,7 +128,7 @@ bash scripts/run_pipeline_checks.sh --window 600
 | altdata_check | ⏳ 운영 환경 필요 | Binance WS 수집 데이터 필요 |
 | feature_check | ⏳ 운영 환경 필요 | predictions 테이블 데이터 필요 |
 | feature_leak_check | ⏳ 운영 환경 필요 | predictions 테이블 데이터 필요 |
-| coinglass_check | ⏳ 운영 환경 필요 | COINGLASS_ENABLED=true + 실키 필요 |
+| coinglass_check | ⏳ 운영 환경 필요 | COINGLASS_ENABLED=true + 실제 키 필요 |
 
 ---
 
@@ -156,7 +156,7 @@ bash scripts/run_pipeline_checks.sh --window 600
 
 | 항목 | 기준 | 비고 |
 |------|------|------|
-| 환경변수 | `COINGLASS_ENABLED=true` + 실키 설정 | 미설정 → 점검 FAIL |
+| 환경변수 | `COINGLASS_ENABLED=true` + 실제 키 설정 | 미설정 → 점검 FAIL |
 | 원클릭 점검 | `bash scripts/run_pipeline_checks.sh --window 600` → `EXIT_CODE=0` | 4개 모듈 모두 PASS |
 | Export | `export_dataset.py` → parquet 생성 + `label_ts >= t0+horizon` 위반 0건 | 0바이트 금지 |
 | 봇 구동 | 최소 10분 (짧은 검증) / 최소 24h (학습 데이터) | 중단 시 원인 분석 |

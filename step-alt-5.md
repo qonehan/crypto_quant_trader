@@ -205,7 +205,7 @@ ls -lh ./data/datasets/btc_24h.parquet
 
 ## 7. 리스크/주의사항
 
-- **환경변수 필수**: `COINGLASS_ENABLED=true` + 실키 미설정 → 점검 FAIL (ALT-3 정책)
+- **환경변수 필수**: `COINGLASS_ENABLED=true` + 실제 키 미설정 → 점검 FAIL (ALT-3 정책)
 - **데이터 편향**: 봇 중단 시 특정 시간대만 존재 → Export 데이터셋 편향
 - **NONE 라벨**: 라벨 전부 NONE이면 r_t가 너무 크거나 변동성 낮은 구간 → 다음 Step에서 r_t 튜닝
 - **Codespaces 유휴**: Codespaces가 30분 유휴 시 자동 중단될 수 있음 → 터미널 활동 유지 필요
