@@ -22,7 +22,7 @@
 - **스크립트 준비**: ✅ `run_pipeline_checks.sh`, `export_dataset.py`, `activate_env_keys.py` 존재
 - **진단 모듈 준비**: ✅ `altdata_check`, `feature_check`, `feature_leak_check`, `coinglass_check` 존재
 - **데이터 디렉토리**: ✅ `data/datasets/` 생성, `.gitignore` 설정 완료
-- **환경변수**: ⚠️ `.env`에 실제 API 키 설정 필요 (maintainer 작업)
+- **환경변수**: ✅ 필수 (미설정이면 점검 FAIL — ALT-3 정책)
 
 ---
 
@@ -152,31 +152,33 @@ bash scripts/run_pipeline_checks.sh --window 600
 
 ---
 
-## 6. 다음 액션
+## 6. PASS 기준 (DoD)
 
-### 즉시 (maintainer)
-1. PR #2 (`copilot/review-alt-3-changes`) → main 머지
-2. PR #1 (`copilot/force-actual-data-collection`) Close
-3. `.env`에 실제 Coinglass API 키 설정
+| 항목 | 기준 | 비고 |
+|------|------|------|
+| 환경변수 | `COINGLASS_ENABLED=true` + 실키 설정 | 미설정 → 점검 FAIL |
+| 원클릭 점검 | `bash scripts/run_pipeline_checks.sh --window 600` → `EXIT_CODE=0` | 4개 모듈 모두 PASS |
+| Export | `export_dataset.py` → parquet 생성 + `label_ts >= t0+horizon` 위반 0건 | 0바이트 금지 |
+| 봇 구동 | 최소 10분 (짧은 검증) / 최소 24h (학습 데이터) | 중단 시 원인 분석 |
+| 코드 컴파일 | 51개 Python 파일 전체 성공 | ✅ 완료 |
+
+---
+
+## 7. 다음 액션
 
 ### 1일차 운영 루프
-1. `poetry run python -m app.bot` 10분+ 구동
-2. `bash scripts/run_pipeline_checks.sh --window 600` → EXIT_CODE=0 확인
-3. `poetry run python scripts/export_dataset.py --output ./data/datasets/btc_dataset.parquet --horizon 120`
-4. 결과 확인 후 봇을 24시간 연속 구동
+1. `.env`에 `COINGLASS_ENABLED=true` + 실제 API 키 설정
+2. `poetry run python -m app.bot` 10분+ 구동
+3. `bash scripts/run_pipeline_checks.sh --window 600` → EXIT_CODE=0 확인
+4. `poetry run python scripts/export_dataset.py --output ./data/datasets/btc_dataset.parquet --horizon 120`
+5. 결과 확인 후 봇을 24시간 연속 구동
 
 ### 24h 후
 1. `bash scripts/run_pipeline_checks.sh --window 600`
 2. `poetry run python scripts/export_dataset.py --output ./data/datasets/btc_24h.parquet --horizon 120`
+3. 라벨 분포 확인 (NONE만이면 r_t 튜닝 필요)
 
 ### 모델 단계 (우선순위 순)
 1. **라벨 품질 점검 + r_t 튜닝**: UP/DOWN 비율 확보, r_t 고정값 vs 동적값 비교
 2. **피처 표준화**: `predictions` + altdata + coinglass를 학습용 뷰/테이블로 표준화
 3. **백테스트/검증 루프**: 수수료/슬리피지 포함 PnL, buy&hold 대비, drawdown/hit rate
-
-### PR 상태
-
-| PR | 브랜치 | 상태 | 처리 |
-|----|--------|------|------|
-| #1 | `copilot/force-actual-data-collection` | Open | maintainer가 Close |
-| #2 | `copilot/review-alt-3-changes` | Open | maintainer가 Merge |
