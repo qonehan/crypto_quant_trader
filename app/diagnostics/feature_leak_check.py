@@ -46,9 +46,9 @@ def check_prediction_timestamp_order(conn, symbol: str, window_sec: int) -> tupl
         conn,
         """SELECT count(*) as violations FROM predictions
            WHERE symbol=:sym
-             AND t0 >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'
-             AND t0 > created_at""".replace("{w}", str(window_sec)),
-        {"sym": symbol},
+             AND t0 >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)
+             AND t0 > created_at""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if err or rows is None:
         lines.append(f"  ERROR: {err}")
@@ -60,10 +60,8 @@ def check_prediction_timestamp_order(conn, symbol: str, window_sec: int) -> tupl
         conn,
         """SELECT count(*) as total FROM predictions
            WHERE symbol=:sym
-             AND t0 >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND t0 >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     total = rows2[0][0] if rows2 else 0
 
@@ -84,13 +82,11 @@ def check_evaluation_horizon(
     rows, err = _safe_query(
         conn,
         """SELECT count(*) as total,
-              count(CASE WHEN ts < t0 + interval '{h} seconds' THEN 1 END) as early_evals
+              count(CASE WHEN ts < t0 + make_interval(secs => :hsec) THEN 1 END) as early_evals
            FROM evaluation_results
            WHERE symbol=:sym
-             AND t0 >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ).replace("{h}", str(h_sec)),
-        {"sym": symbol},
+             AND t0 >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec, "hsec": h_sec},
     )
     if err or rows is None:
         lines.append(f"  ERROR: {err}")
@@ -124,10 +120,8 @@ def check_feature_market_alignment(
         conn,
         """SELECT count(*) as total FROM predictions
            WHERE symbol=:sym
-             AND t0 >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND t0 >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if err or rows is None:
         lines.append(f"  ERROR: {err}")
@@ -150,10 +144,8 @@ def check_feature_market_alignment(
              max(EXTRACT(EPOCH FROM (created_at - t0))) as max_latency
            FROM predictions
            WHERE symbol=:sym
-             AND t0 >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND t0 >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if rows2 and rows2[0][0] is not None:
         avg_lat = rows2[0][0]

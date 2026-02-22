@@ -68,10 +68,8 @@ def check_call_status(conn, symbol: str, window_sec: int) -> tuple[bool, str]:
         conn,
         """SELECT count(*) as ok_cnt FROM coinglass_call_status
            WHERE symbol=:sym AND ok=true
-             AND ts >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND ts >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if err or rows is None:
         lines.append(f"  ERROR: {err}")
@@ -106,10 +104,8 @@ def check_liq_map(conn, symbol: str, window_sec: int) -> tuple[bool, str]:
         conn,
         """SELECT count(*) as cnt FROM coinglass_liquidation_map
            WHERE symbol=:sym
-             AND ts >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND ts >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if err or rows is None:
         lines.append(f"  ERROR: {err}")

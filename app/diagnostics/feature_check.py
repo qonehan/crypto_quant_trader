@@ -51,10 +51,8 @@ def check_predictions_quality(conn, symbol: str, window_sec: int) -> tuple[bool,
              count(spread_bps) as spread_bps_cnt
            FROM predictions
            WHERE symbol=:sym
-             AND t0 >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND t0 >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if err or rows is None:
         lines.append(f"  ERROR: {err}")
@@ -88,10 +86,8 @@ def check_predictions_quality(conn, symbol: str, window_sec: int) -> tuple[bool,
              min(p_none) as min_pnone, max(p_none) as max_pnone
            FROM predictions
            WHERE symbol=:sym
-             AND t0 >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND t0 >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if rows2:
         r = rows2[0]
@@ -122,10 +118,8 @@ def check_market_features(conn, symbol: str, window_sec: int) -> tuple[bool, str
              count(ask_close_1s) as ask_cnt
            FROM market_1s
            WHERE symbol=:sym
-             AND ts >= now() AT TIME ZONE 'UTC' - interval '{w} seconds'""".replace(
-            "{w}", str(window_sec)
-        ),
-        {"sym": symbol},
+             AND ts >= now() AT TIME ZONE 'UTC' - make_interval(secs => :wsec)""",
+        {"sym": symbol, "wsec": window_sec},
     )
     if err or rows is None:
         lines.append(f"  ERROR: {err}")
