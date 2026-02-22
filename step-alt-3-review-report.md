@@ -2,7 +2,8 @@
 
 > **작업일시**: 2026-02-22  
 > **브랜치**: `copilot/force-actual-data-collection` → `copilot/review-alt-3-changes` (main 병합 대상)  
-> **목적**: ALT-3 변경사항(Coinglass 실수집 강제 / Export 라벨 누수 방지 / 원클릭 점검) 리뷰 후 main 반영
+> **목적**: ALT-3 변경사항(Coinglass 실수집 강제 / Export 라벨 누수 방지 / 원클릭 점검) 리뷰 후 main 반영  
+> **상태**: ✅ 리뷰 완료 — PR #2 머지 후 브랜치 삭제 필요
 
 ---
 
@@ -14,10 +15,10 @@
 
 | 항목 | 수치 |
 |------|------|
-| 변경 파일 수 | **25개** |
-| 추가 코드 | **+775줄** |
+| 변경 파일 수 | **26개** |
+| 추가 코드 | **+993줄** |
 | 삭제 코드 | **-2,340줄** |
-| 신규 파일 | 3개 (`scripts/export_dataset.py`, `scripts/run_pipeline_checks.sh`, `step-alt-3-improvements.md`) |
+| 신규 파일 | 4개 (`scripts/export_dataset.py`, `scripts/run_pipeline_checks.sh`, `step-alt-3-improvements.md`, `step-alt-3-review-report.md`) |
 | 삭제 파일 | 8개 (`app/features/*`, `app/diagnostics/prune_altdata.py`, 구 step 문서 4개) |
 
 ---
@@ -164,6 +165,7 @@ f"... interval '{window_sec} seconds'"
 | `scripts/export_dataset.py` | 라벨 누수 방지 Export (merge_asof forward + label_ts 검증) |
 | `scripts/run_pipeline_checks.sh` | 운영 점검 원클릭 스크립트 (4개 점검, exit 1 on FAIL) |
 | `step-alt-3-improvements.md` | ALT-3 변경 요약 문서 |
+| `step-alt-3-review-report.md` | ALT-3 리뷰 & 병합 작업 보고서 (본 문서) |
 
 ### 삭제 파일 (D)
 
@@ -216,3 +218,77 @@ poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 1
 - **SQL injection**: 진단 모듈 전체(11곳)에서 문자열 보간 → 파라미터화 쿼리로 수정 완료
 - **CodeQL 스캔**: 0 alerts (보안 취약점 없음)
 - **API 키 노출 방지**: `is_real_key()` 제거 후 단순 boolean 체크로 전환, 키 값 로그 출력 없음
+
+---
+
+## 8. main 병합 & 브랜치 정리 절차
+
+### 8-1. 병합 방법
+
+PR #2 (`copilot/review-alt-3-changes` → `main`)를 GitHub에서 Merge:
+
+```
+GitHub → PR #2 → "Merge pull request" → "Confirm merge"
+```
+
+또는 CLI로:
+```bash
+git switch main
+git pull --ff-only origin main
+git merge --no-ff copilot/review-alt-3-changes -m "Merge ALT-3: enforce Coinglass + export label integrity + pipeline checks"
+git push origin main
+```
+
+### 8-2. 브랜치 삭제 (main 반영 완료 후)
+
+```bash
+# 원격 브랜치 삭제
+git push origin --delete copilot/force-actual-data-collection
+git push origin --delete copilot/review-alt-3-changes
+
+# 로컬 브랜치 삭제
+git switch main
+git branch -D copilot/force-actual-data-collection 2>/dev/null || true
+git branch -D copilot/review-alt-3-changes 2>/dev/null || true
+
+# 확인
+git fetch --prune
+git branch -a | grep copilot || echo "OK: copilot 브랜치 모두 삭제됨"
+```
+
+### 8-3. PR 정리
+
+| PR | 브랜치 | 처리 |
+|----|--------|------|
+| #1 | `copilot/force-actual-data-collection` | Close (중간 산출물, 최종본은 #2) |
+| #2 | `copilot/review-alt-3-changes` | **Merge** → main 반영 후 브랜치 삭제 |
+
+### 8-4. 병합 후 검증
+
+```bash
+# ALT-3 커밋이 main에 존재하는지 확인
+git log --oneline --decorate -10
+
+# 원클릭 점검
+bash scripts/run_pipeline_checks.sh --window 600
+
+# Export 검증
+poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 120
+ls -lh dataset.parquet
+```
+
+---
+
+## 9. 최종 체크리스트
+
+- [x] `copilot/review-alt-3-changes`가 ALT-3 최종본 (copilot/force-actual-data-collection + SQL injection 수정 + 보고서)
+- [x] Python 구문 검사 14개 파일 전체 PASS
+- [x] 제거 대상 참조(`is_real_key`, `feature_snapshots`, `app.features`) 잔존 0건
+- [x] SQL injection 취약 패턴 잔존 0건 (변경 파일 내)
+- [x] CodeQL 보안 스캔 0 alerts
+- [ ] PR #2 → main 머지 완료
+- [ ] PR #1 Close 처리
+- [ ] 원격 브랜치 2개 삭제 완료 (`copilot/force-actual-data-collection`, `copilot/review-alt-3-changes`)
+- [ ] 로컬 브랜치 정리 완료
+- [ ] `bash scripts/run_pipeline_checks.sh --window 600` → EXIT_CODE=0
+- [ ] `poetry run python scripts/export_dataset.py --output dataset.parquet --horizon 120` → 파일 생성 성공
