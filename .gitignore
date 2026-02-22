@@ -13,3 +13,6 @@ __pycache__/
 # Data files (parquet/csv exports)
 data/datasets/*.parquet
 data/datasets/*.csv
+
+# Runtime logs
+logs/
