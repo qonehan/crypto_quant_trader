@@ -1,0 +1,71 @@
+{
+  "input": "./data/datasets/btc_80m_h1800_clean.parquet",
+  "horizon": 1800,
+  "drop_pnone": true,
+  "features": [
+    "p_up",
+    "p_down",
+    "ev",
+    "ev_rate",
+    "r_t",
+    "z_barrier",
+    "spread_bps",
+    "mom_z",
+    "imb_notional_top5",
+    "entry_mid"
+  ],
+  "n_total": 599,
+  "split": {
+    "train_end": 419,
+    "valid_end": 509,
+    "test_n": 90
+  },
+  "metrics_test": {
+    "rmse": 0.00027649,
+    "rmse_naive0": 0.0009878,
+    "mae": 0.0002324,
+    "ic_pearson": 0.12976,
+    "sign_acc": 1.0
+  },
+  "gamma_grid_valid": [
+    {
+      "gamma": 0.5,
+      "valid_n_trades": 1,
+      "valid_total_pnl_net": -0.0004345165116174329
+    },
+    {
+      "gamma": 0.8,
+      "valid_n_trades": 1,
+      "valid_total_pnl_net": -0.0004345165116174329
+    },
+    {
+      "gamma": 1.0,
+      "valid_n_trades": 1,
+      "valid_total_pnl_net": 0.00019994000299985016
+    },
+    {
+      "gamma": 1.5,
+      "valid_n_trades": 1,
+      "valid_total_pnl_net": 0.0003596872719274567
+    },
+    {
+      "gamma": 2.0,
+      "valid_n_trades": 0,
+      "valid_total_pnl_net": 0.0
+    }
+  ],
+  "gamma_selected": {
+    "gamma": 1.5,
+    "valid_total_pnl_net": 0.00035969
+  },
+  "test_trades": {
+    "n": 0,
+    "long_n": 0,
+    "short_n": 0,
+    "win_rate_gross": 0.0,
+    "win_rate_net": 0.0,
+    "total_pnl_gross": 0.0,
+    "total_pnl_net": 0.0,
+    "avg_pnl_net_per_trade": null
+  }
+}

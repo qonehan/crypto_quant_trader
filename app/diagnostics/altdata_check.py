@@ -131,11 +131,20 @@ def check_mark_price(conn, symbol: str, window_sec: int) -> tuple[bool, str]:
 def check_futures_metrics(conn, symbol: str, poll_sec: int) -> tuple[bool, str]:
     lines = ["[binance_futures_metrics]"]
 
-    required_metrics = ["open_interest", "global_ls_ratio", "taker_ls_ratio", "basis"]
-    threshold_sec = poll_sec * 2 + 30
+    # snapshot 지표: 1s 급 → 좁은 임계값
+    threshold_snapshot = poll_sec * 2 + 30
+    # 5m 성격 지표(basis/ls_ratio): 간헐적 지연 허용 → max(210s, poll*3+30)
+    threshold_5m = max(210, poll_sec * 3 + 30)
+
+    metric_thresholds = {
+        "open_interest": threshold_snapshot,
+        "global_ls_ratio": threshold_5m,
+        "taker_ls_ratio": threshold_5m,
+        "basis": threshold_5m,
+    }
 
     all_ok = True
-    for metric in required_metrics:
+    for metric, thr in metric_thresholds.items():
         rows, err = _safe_query(
             conn,
             """SELECT max(ts) as max_ts FROM binance_futures_metrics
@@ -148,11 +157,12 @@ def check_futures_metrics(conn, symbol: str, poll_sec: int) -> tuple[bool, str]:
             continue
         max_ts = rows[0][0]
         lag = _lag(max_ts)
-        ok_m = lag is not None and lag <= threshold_sec
+        ok_m = lag is not None and lag <= thr
         if not ok_m:
             all_ok = False
         lines.append(
-            f"  [{metric}] lag={_lag_badge(lag, warn_sec=threshold_sec*0.5, fail_sec=threshold_sec)}"
+            f"  [{metric}] lag={_lag_badge(lag, warn_sec=thr*0.5, fail_sec=thr)}"
+            + (f" (thr={thr}s)" if thr != threshold_snapshot else "")
         )
 
     rows3, _ = _safe_query(

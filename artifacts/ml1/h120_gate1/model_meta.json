@@ -1,0 +1,16 @@
+{
+  "feature_cols": [
+    "p_up",
+    "p_down",
+    "p_none",
+    "ev",
+    "ev_rate",
+    "r_t",
+    "z_barrier",
+    "spread_bps",
+    "mom_z",
+    "imb_notional_top5",
+    "entry_mid"
+  ],
+  "time_col": "ts"
+}

@@ -6,6 +6,7 @@
   "runServices": ["db"],
   "forwardPorts": [8501],
   "postCreateCommand": "poetry config virtualenvs.in-project true && (test -f .env || cp .env.example .env) && poetry install",
+  "postStartCommand": "bash -lc 'mkdir -p logs && nohup bash scripts/run_bot_forever.sh >> logs/bot_supervisor.log 2>&1 &'",
   "customizations": {
     "vscode": {
       "settings": {

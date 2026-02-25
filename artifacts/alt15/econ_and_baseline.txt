@@ -1,0 +1,40 @@
+======================================================================
+ECON SUMMARY
+======================================================================
+                         file   n  absret_q50  absret_q80  cost_q50  P(|ret|>cost)  P(|ret|>2cost)  P(ret>cost)  P(ret<-cost)  mean_ret  std_ret
+ btc_alt15_h900_maker.parquet 779    0.000676    0.001486   0.00048         0.6765          0.3055        0.172        0.5045 -0.000624 0.000907
+ btc_alt15_h900_taker.parquet 779    0.000676    0.001486   0.00108         0.3273          0.0167        0.000        0.3273 -0.000624 0.000907
+btc_alt15_h1800_maker.parquet 599    0.001234    0.001797   0.00055         0.9249          0.5259        0.000        0.9249 -0.001320 0.000499
+btc_alt15_h1800_taker.parquet 599    0.001234    0.001797   0.00115         0.4825          0.0584        0.000        0.4825 -0.001320 0.000499
+
+======================================================================
+BASELINE (test 15%, non-overlap)
+======================================================================
+
+  btc_alt15_h900_maker.parquet  H=900s
+    test_rows=117  nonoverlap_n=1  ⚠️  nonoverlap_n<10
+    avg_label_ret=0.000466  std=0.000000
+    FLAT         net=0.000000
+    ALWAYS_SHORT net=-0.000886
+    ALWAYS_LONG  net=0.000046
+
+  btc_alt15_h900_taker.parquet  H=900s
+    test_rows=117  nonoverlap_n=1  ⚠️  nonoverlap_n<10
+    avg_label_ret=0.000466  std=0.000000
+    FLAT         net=0.000000
+    ALWAYS_SHORT net=-0.001486
+    ALWAYS_LONG  net=-0.000554
+
+  btc_alt15_h1800_maker.parquet  H=1800s
+    test_rows=90  nonoverlap_n=1  ⚠️  nonoverlap_n<10
+    avg_label_ret=-0.000831  std=0.000000
+    FLAT         net=0.000000
+    ALWAYS_SHORT net=0.000421
+    ALWAYS_LONG  net=-0.001241
+
+  btc_alt15_h1800_taker.parquet  H=1800s
+    test_rows=90  nonoverlap_n=1  ⚠️  nonoverlap_n<10
+    avg_label_ret=-0.000831  std=0.000000
+    FLAT         net=0.000000
+    ALWAYS_SHORT net=-0.000179
+    ALWAYS_LONG  net=-0.001841
