@@ -1,0 +1,107 @@
+===== ALT-15/16 FULL EVAL 2026-02-24 11:02:44 =====
+  window=600s  hours=48h  outdir=artifacts/alt15
+  ⚠️  --skip-continuity: continuity FAIL 무시 모드 (임시 평가용)
+
+[1/4] continuity_check...
+  [SKIP_CONT] continuity_check를 경고로만 실행 (FAIL해도 계속 진행)
+============================================================
+  Continuity Check (데이터 연속성 진단)
+  now_utc           = 2026-02-24T11:02:45.536909+00:00
+  hours             = 48h
+  pred_gap_thr      = 60.0s
+  mkt_gap_thr       = 10.0s
+============================================================
+
+[1] predictions 연속성 체크...
+  n              = 1,834
+  ts_range       = 2026-02-22 11:48:55+00:00 ~ 2026-02-24 11:02:45+00:00
+  max_gap_sec    = 155555.0s  (threshold=60.0s)
+  avg_gap_sec    = 92.71s
+  ❌ max_gap_sec(155555.0s) > threshold(60.0s)
+  → FAIL ❌
+
+[2] market_1s 연속성 체크...
+  n              = 9,174
+  ts_range       = 2026-02-22 11:48:50+00:00 ~ 2026-02-24 11:02:45+00:00
+  max_gap_sec    = 155550.0s  (threshold=10.0s)
+  avg_gap_sec    = 18.53s
+  ❌ max_gap_sec(155550.0s) > threshold(10.0s)
+  → FAIL ❌
+
+[3] 연속 구간 분석 (segments)...
+  총 segments = 3
+  seg# 1: rows= 958  dur=1.33h  [2026-02-22 11:48:50 ~ 2026-02-22 13:08:35] ← largest
+  seg# 2: rows= 842  dur=1.17h  [2026-02-24 08:21:10 ~ 2026-02-24 09:31:15]
+  seg# 3: rows=  35  dur=0.05h  [2026-02-24 10:59:55 ~ 2026-02-24 11:02:45]
+
+============================================================
+  결과 요약:
+    predictions : FAIL ❌  (max_gap=155555.0s, n=1,834)
+    market_1s   : FAIL ❌  (max_gap=155550.0s, n=9,174)
+
+  OVERALL: FAIL ❌
+============================================================
+  [SKIP_CONT] 계속 진행...
+
+[2/4] core pipeline checks (HARD GATE)...
+============================================================
+  Alt Data 파이프라인 점검
+  now_utc          = 2026-02-24T11:02:46.815126+00:00
+  binance_symbol   = BTCUSDT
+  coinglass_symbol = BTC
+  window           = 600s
+  BINANCE_POLL_SEC = 60s
+  COINGLASS_POLL_SEC = 300s
+  COINGLASS_KEY_SET  = False
+  COINGLASS_ENABLED  = False
+============================================================
+[binance_mark_price_1s]
+  max(ts)   = 2026-02-24 11:02:46+00:00
+  lag_sec   = 0.8s ✅
+  count(window=600s) = 174 / expected=600
+  fill_rate = 29.0% ❌
+  last 3 rows:
+  ts=2026-02-24 11:02:46+00:00, mark_price=63283.4, index_price=63310.37456522, funding_rate=-3.247e-05
+  ts=2026-02-24 11:02:45.001000+00:00, mark_price=63283.4, index_price=63310.37456522, funding_rate=-3.247e-05
+  ts=2026-02-24 11:02:44.002000+00:00, mark_price=63283.4, index_price=63310.41413043, funding_rate=-3.247e-05
+  → FAIL ❌
+
+[binance_futures_metrics]
+  [open_interest] lag=53.0s ✅
+  [global_ls_ratio] lag=106.8s ⚠️ (thr=210s)
+  [taker_ls_ratio] lag=106.8s ⚠️ (thr=210s)
+  [basis] lag=226.8s ❌ (thr=210s)
+  last rows:
+  ts=2026-02-24 11:01:53.860000+00:00, symbol=BTCUSDT, metric=open_interest, value=81715.433, period=snapshot
+  ts=2026-02-24 11:01:00+00:00, symbol=BTCUSDT, metric=global_ls_ratio, value=2.5075, period=5m
+  ts=2026-02-24 11:01:00+00:00, symbol=BTCUSDT, metric=taker_ls_ratio, value=0.6538, period=5m
+  ts=2026-02-24 11:00:50.633000+00:00, symbol=BTCUSDT, metric=open_interest, value=81718.806, period=snapshot
+  ts=2026-02-24 11:00:00+00:00, symbol=BTCUSDT, metric=taker_ls_ratio, value=0.6538, period=5m
+  ts=2026-02-24 11:00:00+00:00, symbol=BTCUSDT, metric=global_ls_ratio, value=2.5075, period=5m
+  ts=2026-02-24 10:59:47.515000+00:00, symbol=BTCUSDT, metric=open_interest, value=81712.914, period=snapshot
+  ts=2026-02-24 10:59:00+00:00, symbol=BTCUSDT, metric=taker_ls_ratio, value=2.4969, period=5m
+  → FAIL ❌
+
+[binance_force_orders]
+  count(last 24h)  = 39
+  last event ts    = 2026-02-24 09:25:33.439000+00:00
+  ⚠️  이벤트가 0건이어도 WS 연결이 정상이면 PASS (청산이 없을 수 있음)
+  last 3 rows:
+  ts=2026-02-24 09:25:33.439000+00:00, side=SELL, price=62834.2, qty=0.003, notional=188.5026
+  ts=2026-02-24 09:23:43.294000+00:00, side=SELL, price=62838.8, qty=0.002, notional=125.67760000000001
+  ts=2026-02-24 09:23:38.742000+00:00, side=SELL, price=62847.1, qty=0.012, notional=754.1652
+  → PASS ✅ (connection-based check)
+
+[coinglass_liquidation_map]
+  max_ts = None (no data yet — COINGLASS_API_KEY 미설정이면 정상)
+  → SKIP ✅
+
+============================================================
+  개별 결과:
+    binance_mark_price_1s              : FAIL ❌
+    binance_futures_metrics            : FAIL ❌
+    binance_force_orders               : PASS ✅
+    coinglass_liquidation_map          : PASS ✅
+
+  OVERALL: FAIL ❌
+============================================================

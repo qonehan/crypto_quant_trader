@@ -1,7 +1,7 @@
 """Coinglass REST polling collector.
 
 Polls Pair Liquidation History every COINGLASS_POLL_SEC seconds.
-COINGLASS_ENABLED=True 시 is_real_key() 검사 강제. False(기본)면 키 없을 때 SKIP.
+Requires COINGLASS_API_KEY in env; skips gracefully if key is empty.
 """
 
 from __future__ import annotations
@@ -12,10 +12,10 @@ import time
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy.engine import Engine
 
 from app.altdata.writer import insert_coinglass_call_status, insert_coinglass_liq_map
-from app.config import Settings, is_real_key
-from sqlalchemy.engine import Engine
+from app.config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +27,12 @@ def _build_summary(raw: dict | list) -> dict:
     """Extract key summary stats from Coinglass liquidation payload."""
     summary: dict = {}
     try:
+        # Handle various response shapes
         data = raw
         if isinstance(raw, dict):
             data = raw.get("data") or raw
         if isinstance(data, list):
+            # Liquidation history: list of {t, longLiquidationUsd, shortLiquidationUsd}
             long_total = sum(
                 float(r.get("longLiquidationUsd") or r.get("longLiq") or 0)
                 for r in data
@@ -43,6 +45,7 @@ def _build_summary(raw: dict | list) -> dict:
             summary["short_liq_usd_total"] = short_total
             summary["row_count"] = len(data)
             if data:
+                # Most recent entry
                 last = data[-1]
                 summary["last_long_liq"] = float(
                     last.get("longLiquidationUsd") or last.get("longLiq") or 0
@@ -66,25 +69,12 @@ class CoinglassRestPoller:
         self._stop = False
         self.last_poll_ts: float = 0.0
         self.poll_count: int = 0
-        self.enabled: bool = is_real_key(settings.COINGLASS_API_KEY)
-        self._last_warn_ts: float = 0.0  # anti-spam for key-invalid log
+        self.enabled: bool = bool(settings.COINGLASS_ENABLED and settings.COINGLASS_API_KEY)
 
     async def run(self) -> None:
         s = self.settings
         if not self.enabled:
-            raw_val = s.COINGLASS_API_KEY or ""
-            if not raw_val.strip():
-                reason = "COINGLASS_API_KEY 미설정(빈 값)"
-            else:
-                reason = f"COINGLASS_API_KEY 비정상(placeholder/너무 짧음): '{raw_val[:20]}'"
-            if s.COINGLASS_ENABLED:
-                log.error(
-                    "CoinglassRestPoller: 설정 오류(COINGLASS_ENABLED=True) — %s. "
-                    "COINGLASS_API_KEY에 실제 키를 입력하세요.",
-                    reason,
-                )
-            else:
-                log.warning("CoinglassRestPoller: %s → SKIP (COINGLASS_ENABLED=False).", reason)
+            log.info("CoinglassRestPoller: COINGLASS_API_KEY not set, skipping")
             return
 
         symbol = s.ALT_SYMBOL_COINGLASS
@@ -92,84 +82,92 @@ class CoinglassRestPoller:
         base = s.COINGLASS_BASE
         headers = {
             "CG-API-KEY": s.COINGLASS_API_KEY,
-            "coinglassSecret": s.COINGLASS_API_KEY,
+            "coinglassSecret": s.COINGLASS_API_KEY,  # some endpoints use this header
         }
 
         async with httpx.AsyncClient(base_url=base, headers=headers) as client:
             while not self._stop:
                 try:
                     now = datetime.now(timezone.utc)
-                    t_start = time.time()
-                    ok, http_status, error_msg = await self._poll_liq_history(
-                        client, symbol, now
-                    )
-                    latency_ms = int((time.time() - t_start) * 1000)
+                    await self._poll_liq_history(client, symbol, now)
                     self.last_poll_ts = time.time()
                     self.poll_count += 1
-                    insert_coinglass_call_status(
-                        self.engine, now, ok, http_status, error_msg,
-                        latency_ms, self.poll_count,
+                    log.info(
+                        "Coinglass poll #%d done (symbol=%s)", self.poll_count, symbol
                     )
-                    if ok:
-                        log.info(
-                            "Coinglass poll #%d done (symbol=%s latency=%dms)",
-                            self.poll_count, symbol, latency_ms,
-                        )
-                    else:
-                        log.warning(
-                            "Coinglass poll #%d FAILED (http=%s err=%s)",
-                            self.poll_count, http_status, (error_msg or "")[:100],
-                        )
                 except asyncio.CancelledError:
                     break
                 except Exception:
-                    log.exception("Coinglass poll loop error")
+                    log.exception("Coinglass poll error")
                 await asyncio.sleep(poll_sec)
 
     async def _poll_liq_history(
         self, client: httpx.AsyncClient, symbol: str, now: datetime
-    ) -> tuple[bool, int | None, str | None]:
-        """Fetch liquidation history. Returns (ok, http_status, error_msg)."""
+    ) -> None:
+        """Fetch liquidation history and store to DB."""
+        # Try the public open-api endpoint for liquidation history
         endpoint = "/api/pro/v1/futures/liquidation/detail"
         params = {
             "symbol": symbol,
-            "timeType": 1,
+            "timeType": 1,   # 1h
             "limit": 12,
         }
 
-        last_exc_msg: str | None = None
         for attempt in range(_MAX_RETRY):
+            t0 = time.time()
             try:
                 resp = await client.get(endpoint, params=params, timeout=15.0)
+                latency_ms = int((time.time() - t0) * 1000)
                 if resp.status_code == 200:
                     raw = resp.json()
                     summary = _build_summary(raw)
                     insert_coinglass_liq_map(
-                        self.engine, now, symbol,
-                        exchange="all", timeframe="1h",
-                        summary=summary, raw=raw,
+                        self.engine,
+                        now,
+                        symbol,
+                        exchange="all",
+                        timeframe="1h",
+                        summary=summary,
+                        raw=raw,
                     )
-                    return True, 200, None
+                    insert_coinglass_call_status(
+                        self.engine, symbol, ok=True,
+                        http_status=200, latency_ms=latency_ms,
+                    )
+                    return
                 if resp.status_code in (429, 418):
                     wait = _RETRY_BASE * (2 ** attempt)
                     log.warning(
                         "Coinglass rate limit %d, retry in %.1fs", resp.status_code, wait
                     )
+                    insert_coinglass_call_status(
+                        self.engine, symbol, ok=False,
+                        http_status=resp.status_code,
+                        error_msg=f"rate_limit_{resp.status_code}",
+                        latency_ms=latency_ms,
+                    )
                     await asyncio.sleep(wait)
                     continue
-                err_body = resp.text[:300]
                 log.warning(
-                    "Coinglass HTTP %d — endpoint=%s body=%s",
-                    resp.status_code, endpoint, err_body,
+                    "Coinglass HTTP %d body=%s", resp.status_code, resp.text[:200]
                 )
-                return False, resp.status_code, err_body
+                insert_coinglass_call_status(
+                    self.engine, symbol, ok=False,
+                    http_status=resp.status_code,
+                    error_msg=resp.text[:200],
+                    latency_ms=latency_ms,
+                )
+                return
             except Exception as exc:
-                last_exc_msg = str(exc)
+                latency_ms = int((time.time() - t0) * 1000)
                 wait = _RETRY_BASE * (2 ** attempt)
                 log.warning("Coinglass request error (%s), retry in %.1fs", exc, wait)
+                insert_coinglass_call_status(
+                    self.engine, symbol, ok=False,
+                    error_msg=str(exc)[:200],
+                    latency_ms=latency_ms,
+                )
                 await asyncio.sleep(wait)
-
-        return False, None, last_exc_msg or "max retries exceeded"
 
     def stop(self) -> None:
         self._stop = True

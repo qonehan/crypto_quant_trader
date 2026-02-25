@@ -141,17 +141,19 @@ class BinanceFuturesRestPoller:
             )
 
         # 4) Basis (uses "pair" param instead of "symbol")
-        rows = await _get(
-            client,
-            "/futures/data/basis",
-            {"pair": symbol, "contractType": "PERPETUAL", "period": period, "limit": 2},
-        )
+        basis_params = {"pair": symbol, "contractType": "PERPETUAL", "period": period, "limit": 2}
+        rows = await _get(client, "/futures/data/basis", basis_params)
         if rows and isinstance(rows, list) and len(rows) > 0:
             row = rows[-1]
             basis = float(row.get("basis") or 0) or None
             basis_rate = float(row.get("basisRate") or 0) or None
             upsert_futures_metric(
                 self.engine, ts_bucket, symbol, "basis", basis, basis_rate, period, row
+            )
+        else:
+            log.warning(
+                "basis poll empty/None (symbol=%s period=%s): rows=%r — skipping this cycle",
+                symbol, period, rows,
             )
 
     def stop(self) -> None:

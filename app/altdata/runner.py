@@ -10,7 +10,7 @@ from sqlalchemy.engine import Engine
 from app.altdata.binance_rest import BinanceFuturesRestPoller
 from app.altdata.binance_ws import BinanceForceOrderWs, BinanceMarkPriceWs
 from app.altdata.coinglass_rest import CoinglassRestPoller
-from app.config import Settings, is_real_key
+from app.config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -69,8 +69,8 @@ class CoinglassAltDataRunner:
 
     async def run(self) -> None:
         log.info(
-            "CoinglassAltDataRunner started (key_real=%s)",
-            is_real_key(self.settings.COINGLASS_API_KEY),
+            "CoinglassAltDataRunner started (key_set=%s)",
+            bool(self.settings.COINGLASS_API_KEY),
         )
         try:
             await self.poller.run()

@@ -399,82 +399,22 @@ def apply_migrations(engine: Engine) -> None:
         """))
         log.info("Applied: coinglass_liquidation_map (CREATE IF NOT EXISTS)")
 
-        # ── Step ALT-1: feature_snapshots (학습/모델 입력용 정렬 스냅샷) ──────
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS feature_snapshots (
-                ts                      TIMESTAMPTZ NOT NULL,
-                symbol                  TEXT NOT NULL,
-                -- Upbit market
-                mid_krw                 DOUBLE PRECISION,
-                spread_bps              DOUBLE PRECISION,
-                imb_notional_top5       DOUBLE PRECISION,
-                -- Barrier
-                r_t                     DOUBLE PRECISION,
-                r_min_eff               DOUBLE PRECISION,
-                cost_roundtrip_est      DOUBLE PRECISION,
-                sigma_1s                DOUBLE PRECISION,
-                sigma_h                 DOUBLE PRECISION,
-                k_vol_eff               DOUBLE PRECISION,
-                barrier_status          TEXT,
-                -- Prediction
-                p_up                    DOUBLE PRECISION,
-                p_down                  DOUBLE PRECISION,
-                p_none                  DOUBLE PRECISION,
-                ev                      DOUBLE PRECISION,
-                ev_rate                 DOUBLE PRECISION,
-                action_hat              TEXT,
-                model_version           TEXT,
-                -- Binance mark/index/funding (latest near ts)
-                bin_mark_price          DOUBLE PRECISION,
-                bin_index_price         DOUBLE PRECISION,
-                bin_funding_rate        DOUBLE PRECISION,
-                bin_mark_index_basis    DOUBLE PRECISION,
-                -- Binance metrics (latest within freshness window)
-                oi_value                DOUBLE PRECISION,
-                global_ls_ratio         DOUBLE PRECISION,
-                taker_ls_ratio          DOUBLE PRECISION,
-                basis_value             DOUBLE PRECISION,
-                -- Binance liquidation aggregates (rolling 5m)
-                liq_5m_notional         DOUBLE PRECISION,
-                liq_5m_count            INTEGER,
-                -- Raw debug payload (optional)
-                raw_json                JSONB,
-                PRIMARY KEY (ts, symbol)
-            )
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_feature_snapshots_symbol_ts
-            ON feature_snapshots (symbol, ts DESC)
-        """))
-        log.info("Applied: feature_snapshots (CREATE IF NOT EXISTS)")
-
-        # ── Step ALT-2: feature_snapshots에 source_ts 컬럼 추가 (누수 감지용) ──
-        for col_def in [
-            "bin_mark_ts  TIMESTAMPTZ",
-            "oi_ts        TIMESTAMPTZ",
-            "liq_last_ts  TIMESTAMPTZ",
-        ]:
-            conn.execute(text(
-                f"ALTER TABLE feature_snapshots ADD COLUMN IF NOT EXISTS {col_def}"
-            ))
-        log.info("Applied: feature_snapshots source_ts columns (Step ALT-2)")
-
-        # ── Step ALT-2: coinglass_call_status 테이블 ─────────────────────────
+        # (ALT-5) coinglass_call_status
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS coinglass_call_status (
                 id          BIGSERIAL PRIMARY KEY,
                 ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+                symbol      TEXT NOT NULL,
                 ok          BOOLEAN NOT NULL,
                 http_status INTEGER,
                 error_msg   TEXT,
-                latency_ms  INTEGER,
-                poll_count  INTEGER
+                latency_ms  INTEGER
             )
         """))
         conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_coinglass_call_status_ts
-            ON coinglass_call_status (ts DESC)
+            CREATE INDEX IF NOT EXISTS ix_coinglass_call_status_symbol_ts
+            ON coinglass_call_status (symbol, ts DESC)
         """))
         log.info("Applied: coinglass_call_status (CREATE IF NOT EXISTS)")
 
-    log.info("All migrations complete (v1 + Step 7-11 + Step ALT + Step ALT-1 + Step ALT-2)")
+    log.info("All migrations complete (v1 + Step 7-11 + Step ALT)")

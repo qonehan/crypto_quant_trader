@@ -1,0 +1,35 @@
+{
+  "input": "data/datasets/btc_1h_h300.parquet",
+  "n_rows": 477,
+  "time_col": "ts",
+  "target": "label_return",
+  "horizon_sec": 300,
+  "split": {
+    "train_end": 333,
+    "valid_end": 405,
+    "test_n": 72
+  },
+  "feature_count": 11,
+  "best_model": {
+    "type": "Ridge+StandardScaler",
+    "alpha": 50.0,
+    "valid_rmse": 0.0008211511976005227
+  },
+  "test_metrics": {
+    "rmse": 0.0006021254551317749,
+    "mae": 0.0004944508790133464,
+    "ic_pearson": -0.3168164527393913,
+    "sign_accuracy": 0.5277777777777778
+  },
+  "trade_sim_test": {
+    "p_none_max": 1.0,
+    "trades": 0,
+    "win_rate": null,
+    "avg_pnl_net_per_trade": null,
+    "total_pnl_net": 0.0
+  },
+  "notes": [
+    "non-overlap trade sim uses label_return as per-trade return at entry row",
+    "cost_roundtrip_est is deducted if present; else cost=0"
+  ]
+}

@@ -18,15 +18,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-_PLACEHOLDER_VALUES = {
-    "", "your_key_here", "change_me", "replace_me", "__put_real_key_here__",
-}
-
-
-def _is_placeholder(value: str) -> bool:
-    v = value.strip().lower()
-    return v in _PLACEHOLDER_VALUES or len(v) < 12
-
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / ".env"
 
@@ -80,46 +71,23 @@ def main() -> int:
     active = _parse_env(lines)
 
     appended: list[str] = []
-    replaced: list[str] = []
     for key in CANDIDATE_KEYS:
         if key in active:
-            val = active[key]
-            if _is_placeholder(val):
-                # 활성 라인이 있지만 placeholder → 경고 표시용 값으로 교체
-                placeholder_line = f"{key}=__PUT_REAL_KEY_HERE__\n"
-                new_lines = []
-                for line in lines:
-                    stripped = line.strip()
-                    if not stripped.startswith("#") and "=" in stripped:
-                        k, _, _ = stripped.partition("=")
-                        if k.strip() == key:
-                            new_lines.append(placeholder_line)
-                            continue
-                    new_lines.append(line)
-                lines = new_lines
-                active[key] = "__PUT_REAL_KEY_HERE__"
-                replaced.append(key)
-                print(f"  [{key}] placeholder 감지 → __PUT_REAL_KEY_HERE__ 로 교체 (경고)")
-            else:
-                print(f"  [{key}] already active (valid) — skip")
+            print(f"  [{key}] already active — skip")
             continue
         value = _find_commented_value(lines, key)
         if value is None:
             print(f"  [{key}] no commented line found — skip")
             continue
-        if _is_placeholder(value):
-            new_line = f"{key}=__PUT_REAL_KEY_HERE__\n"
-            print(f"  [{key}] commented placeholder 감지 → __PUT_REAL_KEY_HERE__ 추가")
-        else:
-            new_line = f"{key}={value}\n"
-            print(f"  [{key}] activated from commented line")
+        new_line = f"{key}={value}\n"
         lines.append(new_line)
         active[key] = value
         appended.append(key)
+        print(f"  [{key}] activated from commented line")
 
-    if appended or replaced:
+    if appended:
         ENV_FILE.write_text("".join(lines), encoding="utf-8")
-        print(f"Saved {ENV_FILE} ({len(appended)} activated, {len(replaced)} replaced)")
+        print(f"Saved {ENV_FILE} ({len(appended)} key(s) activated)")
     else:
         print("No changes needed.")
 
@@ -129,19 +97,16 @@ def main() -> int:
         print(f"\nERROR: Required keys missing or empty: {missing}")
         return 1
 
-    # 정보성 출력 (placeholder 포함 여부도 표시)
-    def _key_status(val: str) -> str:
-        if not val:
-            return "NOT SET"
-        if _is_placeholder(val):
-            return f"PLACEHOLDER ({val[:30]})"
-        return "SET (valid)"
-
+    # 정보성 출력
+    binance_key_set = bool(active.get("BINANCE_API_KEY", ""))
+    coinglass_key_set = bool(active.get("COINGLASS_API_KEY", ""))
+    upbit_key_set = bool(active.get("UPBIT_ACCESS_KEY", "")) and bool(
+        active.get("UPBIT_SECRET_KEY", "")
+    )
     print("\n  Key status:")
-    print(f"    UPBIT_ACCESS_KEY  : {_key_status(active.get('UPBIT_ACCESS_KEY', ''))}")
-    print(f"    UPBIT_SECRET_KEY  : {_key_status(active.get('UPBIT_SECRET_KEY', ''))}")
-    print(f"    COINGLASS_API_KEY : {_key_status(active.get('COINGLASS_API_KEY', ''))} (없으면 SKIP)")
-    print(f"    BINANCE_API_KEY   : {_key_status(active.get('BINANCE_API_KEY', ''))} (public OK)")
+    print(f"    UPBIT_ACCESS/SECRET_KEY : {'SET' if upbit_key_set else 'NOT SET'}")
+    print(f"    COINGLASS_API_KEY       : {'SET' if coinglass_key_set else 'NOT SET (Coinglass will SKIP)'}")
+    print(f"    BINANCE_API_KEY         : {'SET' if binance_key_set else 'NOT SET (public endpoints OK)'}")
     print("\nactivate_env_keys: OK")
     return 0
 
