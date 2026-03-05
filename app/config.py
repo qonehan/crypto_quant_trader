@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -116,9 +118,14 @@ class Settings(BaseSettings):
     UPBIT_TEST_REQUIRE_PAPER_PROFILE: str = "test" # must match PAPER_POLICY_PROFILE to allow test
 
     DB_URL: str = "postgresql+psycopg://postgres:postgres@db:5432/quant"
+    GCP_DB_URL: Optional[str] = None
+
+    # ── Predictor ──────────────────────────────────────────────────
+    PREDICTOR_TYPE: str = "baseline"   # baseline | ridge
+    RIDGE_MODEL_PATH: str = ""         # 빈 문자열이면 artifacts/ml1/h{H_SEC}/ridge_model.joblib 사용
 
     # ── Alt Data (Binance / Coinglass) ─────────────────────────────
-    ALT_DATA_ENABLED: bool = True
+    ALT_DATA_ENABLED: bool = False
     ALT_SYMBOL_BINANCE: str = "BTCUSDT"
     ALT_SYMBOL_COINGLASS: str = "BTC"
 

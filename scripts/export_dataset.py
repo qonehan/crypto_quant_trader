@@ -279,7 +279,9 @@ def main() -> int:
     print(f"  output              = {output_path}")
     print(sep)
 
-    engine = create_engine(s.DB_URL)
+    read_url = s.GCP_DB_URL or s.DB_URL
+    engine = create_engine(read_url)
+    print(f"  db_url (read)       = {'GCP_DB_URL' if s.GCP_DB_URL else 'DB_URL (local)'}")
 
     print("\n[1] Loading features...")
     features = load_features(engine, symbol)

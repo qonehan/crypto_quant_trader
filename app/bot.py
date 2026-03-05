@@ -14,8 +14,7 @@ from app.evaluator.evaluator import Evaluator
 from app.marketdata.resampler import MarketResampler
 from app.marketdata.state import MarketState
 from app.marketdata.upbit_ws import UpbitWsClient
-from app.models.baseline_v1 import BaselineModelV1
-from app.predictor.runner import PredictionRunner
+from app.predictor.runner import PredictionRunner, create_model
 from app.altdata.runner import BinanceAltDataRunner, CoinglassAltDataRunner
 from app.exchange.runner import ShadowExecutionRunner, UpbitAccountRunner
 from app.trading.runner import PaperTradingRunner
@@ -113,7 +112,8 @@ async def async_main() -> None:
     client = UpbitWsClient(settings, queue)
     resampler = MarketResampler(state, engine)
     barrier = BarrierController(settings, engine)
-    model = BaselineModelV1()
+    model = create_model(settings)
+    log.info("Predictor: PREDICTOR_TYPE=%s → %s", settings.PREDICTOR_TYPE, type(model).__name__)
     pred_runner = PredictionRunner(settings, engine, model)
     evaluator = Evaluator(settings, engine)
     paper_runner = PaperTradingRunner(settings, engine, state)

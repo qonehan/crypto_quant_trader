@@ -11,9 +11,42 @@ from sqlalchemy.engine import Engine
 
 from app.config import Settings
 from app.db.writer import upsert_prediction
+from app.models.baseline_v1 import BaselineModelV1
 from app.models.interface import BaseModel
 
 log = logging.getLogger(__name__)
+
+
+def create_model(settings: Settings) -> BaseModel:
+    """PREDICTOR_TYPE 설정에 따라 모델 인스턴스를 생성하는 팩토리.
+
+    PREDICTOR_TYPE 값:
+      baseline (기본)  — BaselineModelV1 (규칙 기반)
+      ridge            — RidgePredictor  (선형 Ridge+Scaler)
+      hgbr             — HGBRPredictor   (비선형 HistGradientBoosting)
+    """
+    ptype = (settings.PREDICTOR_TYPE or "baseline").lower()
+
+    if ptype == "ridge":
+        from app.predictor.ml_model import RidgePredictor
+        model_path = settings.RIDGE_MODEL_PATH
+        model = RidgePredictor(model_path=model_path, h_sec=settings.H_SEC)
+        log.info("create_model: RidgePredictor 선택 (path=%s, h_sec=%d)",
+                 model_path or f"artifacts/ml1/h{settings.H_SEC}/ridge_model.joblib",
+                 settings.H_SEC)
+        return model
+
+    if ptype == "hgbr":
+        from app.predictor.ml_model import HGBRPredictor
+        model_path = settings.RIDGE_MODEL_PATH  # 동일 설정 키 재사용 (경로만 다름)
+        model = HGBRPredictor(model_path=model_path, h_sec=settings.H_SEC)
+        log.info("create_model: HGBRPredictor 선택 (path=%s, h_sec=%d)",
+                 model_path or f"artifacts/ml1/h{settings.H_SEC}/ridge_model.joblib",
+                 settings.H_SEC)
+        return model
+
+    log.info("create_model: BaselineModelV1 선택")
+    return BaselineModelV1()
 
 _FETCH_BARRIER_SQL = text("""
 SELECT ts, symbol, h_sec, r_t, sigma_1s, sigma_h, status

@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse, json, math, os
 import numpy as np
 import pandas as pd
+import joblib
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
@@ -217,6 +218,23 @@ def main():
         with open(os.path.join(out_base, "metrics.json"), "w") as f:
             json.dump(res, f, indent=2, ensure_ascii=False)
         tt.to_csv(os.path.join(out_base, "test_trades.csv"), index=False)
+
+        # ── 모델 아티팩트 저장 (joblib + feature_cols.json) ──────────
+        model_path = os.path.join(out_base, "ridge_model.joblib")
+        joblib.dump(model, model_path)
+        meta = {
+            "feature_cols": feat,
+            "time_col": "ts",
+            "model_type": name,
+            "horizon_sec": args.horizon,
+            "gamma_selected": best_gamma,
+            "drop_pnone": bool(args.drop_pnone),
+        }
+        with open(os.path.join(out_base, "model_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(out_base, "feature_cols.json"), "w") as f:
+            json.dump(feat, f, indent=2, ensure_ascii=False)
+        print(f"  model saved  : {model_path}")
 
         print(f"\n{'='*60}")
         print(f"Model: {name} | drop_pnone={args.drop_pnone} | horizon={args.horizon}s")
