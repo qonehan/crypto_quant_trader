@@ -112,36 +112,45 @@ def load_features(engine, symbol: str) -> pd.DataFrame:
 
 
 def load_prices(engine, symbol: str, t_min=None, t_max=None) -> pd.DataFrame:
-    """Load price data from market_1s for label generation.
+    """Load price data from upbit_orderbook (GCP schema) for label generation.
 
-    t_min / t_max: optional bounds to limit price query range.
-    Passing t_max prevents far-future prices from being loaded even if they
-    exist in the DB (e.g. after a bot restart with a big gap).
+    GCP 실제 스키마 기준:
+      - 시간 컬럼: timestamp
+      - 가격 컬럼: level_1_bid_price, level_1_ask_price
+      - symbol 컬럼 없음 → WHERE 절에서 제외
+    mid = (level_1_bid_price + level_1_ask_price) / 2 후 1초 리샘플링(ffill) 반환.
     """
     if t_min is not None and t_max is not None:
         query = text("""
-            SELECT ts, mid_close_1s as mid
-            FROM market_1s
-            WHERE symbol = :sym
-              AND mid_close_1s IS NOT NULL
-              AND ts >= :t_min
-              AND ts <= :t_max
-            ORDER BY ts
+            SELECT timestamp AS ts,
+                   (level_1_bid_price + level_1_ask_price) / 2.0 AS mid
+            FROM upbit_orderbook
+            WHERE level_1_bid_price IS NOT NULL
+              AND level_1_ask_price IS NOT NULL
+              AND timestamp >= :t_min
+              AND timestamp <= :t_max
+            ORDER BY timestamp
         """)
-        params = {"sym": symbol, "t_min": t_min, "t_max": t_max}
+        params = {"t_min": t_min, "t_max": t_max}
     else:
         query = text("""
-            SELECT ts, mid_close_1s as mid
-            FROM market_1s
-            WHERE symbol = :sym AND mid_close_1s IS NOT NULL
-            ORDER BY ts
+            SELECT timestamp AS ts,
+                   (level_1_bid_price + level_1_ask_price) / 2.0 AS mid
+            FROM upbit_orderbook
+            WHERE level_1_bid_price IS NOT NULL
+              AND level_1_ask_price IS NOT NULL
+            ORDER BY timestamp
         """)
-        params = {"sym": symbol}
+        params = {}
 
     with engine.connect() as conn:
         df = pd.read_sql(query, conn, params=params)
-    if "ts" in df.columns:
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+
+    if df.empty:
+        return df
+
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df.set_index("ts")[["mid"]].resample("1s").last().ffill().reset_index()
     return df
 
 
@@ -279,12 +288,13 @@ def main() -> int:
     print(f"  output              = {output_path}")
     print(sep)
 
-    read_url = s.GCP_DB_URL or s.DB_URL
-    engine = create_engine(read_url)
-    print(f"  db_url (read)       = {'GCP_DB_URL' if s.GCP_DB_URL else 'DB_URL (local)'}")
+    engine_local = create_engine(s.DB_URL)
+    engine_gcp = create_engine(s.GCP_DB_URL) if s.GCP_DB_URL else engine_local
+    print(f"  db_url (features)   = DB_URL (local)")
+    print(f"  db_url (prices)     = {'GCP_DB_URL' if s.GCP_DB_URL else 'DB_URL (local, fallback)'}")
 
     print("\n[1] Loading features...")
-    features = load_features(engine, symbol)
+    features = load_features(engine_local, symbol)
     print(f"  features: {len(features)} rows (raw)")
 
     if features.empty:
@@ -321,7 +331,7 @@ def main() -> int:
     print(f"  price query upper bound: {price_t_max} (t_max + max_label_lag_sec)")
 
     print("\n[2] Loading prices (bounded)...")
-    prices = load_prices(engine, symbol, t_min=t_min, t_max=price_t_max)
+    prices = load_prices(engine_gcp, symbol, t_min=t_min, t_max=price_t_max)
     print(f"  prices: {len(prices)} rows")
 
     print("\n[3] Generating labels (merge_asof direction=forward + lag guard)...")
