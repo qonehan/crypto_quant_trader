@@ -45,6 +45,7 @@ _FLAT_PRIORITY = [
     "COOLDOWN",
     "RATE_LIMIT",
     "COST_GT_RT",
+    "MODEL_FLAT",
     "PNONE_HIGH",
     "PDIR_WEAK",
     "EV_RATE_LOW",
@@ -120,6 +121,11 @@ def _decide_flat(
     # Cost vs r_t
     if r_t <= th["cost_rmin_mult"] * cost_est:
         flags.append("COST_GT_RT")
+
+    # Ridge 모델의 action_hat 게이트 — STAY_FLAT/ENTER_SHORT면 진입 차단
+    action_hat = pred_row.get("action_hat")
+    if action_hat is not None and action_hat != "ENTER_LONG":
+        flags.append("MODEL_FLAT")
 
     if p_none > th["enter_pnone_max"]:
         flags.append("PNONE_HIGH")

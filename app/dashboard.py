@@ -7,6 +7,7 @@ if _ROOT not in sys.path:
 
 import json
 
+import altair as alt
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
@@ -101,10 +102,11 @@ def render_tab1(engine, settings, now_utc: datetime) -> None:
 
     if not pred_latest.empty:
         pr = pred_latest.iloc[0]
+        mv = str(pr.get("model_version") or "N/A")
         col_model.metric(
             "AI 모델",
-            str(pr.get("model_version", "N/A")),
-            help="현재 판단에 사용 중인 AI 모델 이름입니다.",
+            mv,
+            help="현재 판단에 사용 중인 AI 모델 이름입니다. ridge_h3600_v1 = 1시간 호흡 Ridge 회귀 모델 (sign_acc 82%).",
         )
     else:
         col_model.info("예측 데이터 없음")
@@ -276,8 +278,46 @@ def render_tab1(engine, settings, now_utc: datetime) -> None:
     else:
         st.info("아직 거래가 없습니다. AI가 매수 신호를 감지하면 자동으로 거래가 시작됩니다.")
 
-    # ── 6. 수익 곡선 ──────────────────────────────────────────────────────────
-    st.markdown("#### 모의 자산 변화 (최근 6시간)")
+    # ── 6. 실시간 Net PnL 및 수익 곡선 ───────────────────────────────────────
+    st.markdown("#### 실시간 순수익(Net PnL) 및 자산 변화 (최근 6시간)")
+    st.caption(
+        "Net PnL = 실현손익 - 업비트 시장가 왕복 수수료(0.1%) - 스프레드 비용. "
+        "fee_krw 컬럼에 이미 수수료가 차감되어 있으며 pnl_krw가 순수익입니다."
+    )
+    # Net PnL 요약 (EXIT_LONG 기준)
+    try:
+        with engine.connect() as conn:
+            net_pnl_df = pd.read_sql_query(
+                text("""
+                    SELECT sum(pnl_krw) as total_net_pnl,
+                           sum(fee_krw) as total_fee,
+                           count(*) as n_exits
+                    FROM paper_trades
+                    WHERE symbol = :sym AND action = 'EXIT_LONG'
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception:
+        net_pnl_df = pd.DataFrame()
+
+    if not net_pnl_df.empty and net_pnl_df.iloc[0]["n_exits"] > 0:
+        np_ = net_pnl_df.iloc[0]
+        na, nb, nc = st.columns(3)
+        total_net = float(np_["total_net_pnl"] or 0)
+        total_fee = float(np_["total_fee"] or 0)
+        na.metric(
+            "총 순수익 (Net PnL)",
+            f"{'+'if total_net>=0 else ''}{total_net:,.0f}원",
+            help="수수료·슬리피지 차감 후 순수익 합계",
+        )
+        nb.metric(
+            "총 납부 수수료",
+            f"{total_fee:,.0f}원",
+            help="왕복 체결 수수료 합계 (매수+매도 각 0.05%)",
+        )
+        nc.metric("청산 횟수", f"{int(np_['n_exits'])}회")
+
     try:
         with engine.connect() as conn:
             eq_df = pd.read_sql_query(
@@ -308,8 +348,8 @@ def render_tab1(engine, settings, now_utc: datetime) -> None:
 
 def render_tab2(engine, settings, now_utc: datetime) -> None:
 
-    # ── 가격 흐름 차트 ────────────────────────────────────────────────────────
-    st.header("가격 흐름 — 최근 5분")
+    # ── 가격 흐름 차트 + 진입 마커 ───────────────────────────────────────────
+    st.header("가격 흐름 — 최근 5분 (ridge_h3600_v1 진입 타점)")
     try:
         with engine.connect() as conn:
             df300 = pd.read_sql_query(
@@ -319,9 +359,81 @@ def render_tab2(engine, settings, now_utc: datetime) -> None:
     except Exception:
         df300 = pd.DataFrame()
 
+    # 최근 5분 paper_trades에서 ENTER_LONG / ENTER_SHORT 이벤트 조회
+    try:
+        with engine.connect() as conn:
+            entry_df = pd.read_sql_query(
+                text("""
+                    SELECT t AS ts, action, price
+                    FROM paper_trades
+                    WHERE symbol = :sym
+                      AND action IN ('ENTER_LONG', 'ENTER_SHORT')
+                      AND t >= now() AT TIME ZONE 'UTC' - interval '5 minutes'
+                    ORDER BY t ASC
+                """),
+                conn,
+                params={"sym": settings.SYMBOL},
+            )
+    except Exception:
+        entry_df = pd.DataFrame()
+
     if not df300.empty:
-        chart_df = df300.sort_values("ts").set_index("ts")
-        st.line_chart(chart_df["mid"], use_container_width=True)
+        price_df = df300.sort_values("ts").copy()
+        price_df["ts"] = pd.to_datetime(price_df["ts"], utc=True)
+
+        base_chart = (
+            alt.Chart(price_df)
+            .mark_line(color="steelblue", strokeWidth=1.5)
+            .encode(
+                x=alt.X("ts:T", title="시각", axis=alt.Axis(format="%H:%M:%S")),
+                y=alt.Y("mid:Q", title="중간가 (KRW)", scale=alt.Scale(zero=False)),
+            )
+        )
+
+        layers = [base_chart]
+
+        if not entry_df.empty:
+            entry_df["ts"] = pd.to_datetime(entry_df["ts"], utc=True)
+            entry_df["price"] = entry_df["price"].astype(float)
+
+            long_df = entry_df[entry_df["action"] == "ENTER_LONG"]
+            short_df = entry_df[entry_df["action"] == "ENTER_SHORT"]
+
+            if not long_df.empty:
+                layers.append(
+                    alt.Chart(long_df)
+                    .mark_point(shape="triangle-up", size=120, color="#1a7f37", filled=True)
+                    .encode(
+                        x="ts:T",
+                        y=alt.Y("price:Q"),
+                        tooltip=[
+                            alt.Tooltip("ts:T", title="진입 시각", format="%H:%M:%S"),
+                            alt.Tooltip("action:N", title="액션"),
+                            alt.Tooltip("price:Q", title="진입가", format=",.0f"),
+                        ],
+                    )
+                )
+            if not short_df.empty:
+                layers.append(
+                    alt.Chart(short_df)
+                    .mark_point(shape="triangle-down", size=120, color="#b91c1c", filled=True)
+                    .encode(
+                        x="ts:T",
+                        y=alt.Y("price:Q"),
+                        tooltip=[
+                            alt.Tooltip("ts:T", title="진입 시각", format="%H:%M:%S"),
+                            alt.Tooltip("action:N", title="액션"),
+                            alt.Tooltip("price:Q", title="진입가", format=",.0f"),
+                        ],
+                    )
+                )
+
+        combined = alt.layer(*layers).properties(height=300)
+        st.altair_chart(combined, use_container_width=True)
+        if entry_df.empty:
+            st.caption("초록 ▲ = ENTER_LONG 타점  |  빨강 ▼ = ENTER_SHORT 타점  (최근 5분간 진입 없음)")
+        else:
+            st.caption("초록 ▲ = ENTER_LONG 타점  |  빨강 ▼ = ENTER_SHORT 타점")
     else:
         st.info("시장 데이터 없음")
 
@@ -1031,10 +1143,28 @@ def main() -> None:
         layout="wide",
     )
     st.title("BTC AI Trading Bot Dashboard")
-    st.caption(f"종목: {load_settings().SYMBOL}  |  기준 시각: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     settings = load_settings()
     now_utc  = datetime.now(timezone.utc)
+
+    # ── 활성 모델 정보 (ACTIVE_MODEL 환경변수 기반 자동 렌더링) ──────────────
+    try:
+        from app.predictor.ml_model import ModelFactory
+        _spec = ModelFactory.get_spec(settings.ACTIVE_MODEL)
+        _model_badge = (
+            f"**{_spec.display_name}**  |  "
+            f"model_id: `{_spec.model_id}`  |  "
+            f"H={_spec.h_sec}s  |  γ={_spec.gamma}  |  version: `{_spec.version}`"
+        )
+    except Exception:
+        _model_badge = f"ACTIVE_MODEL: `{settings.ACTIVE_MODEL}`"
+
+    st.info(f"활성 모델 — {_model_badge}")
+    st.caption(
+        f"종목: {settings.SYMBOL}"
+        f"  |  기준 시각: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        f"  |  .env ACTIVE_MODEL 변경 후 재시작하면 모델이 즉시 교체됩니다."
+    )
 
     # DB 연결 확인
     try:
@@ -1058,6 +1188,11 @@ def main() -> None:
 
     with tab2:
         render_tab2(engine, settings, now_utc)
+
+    # 5초마다 자동 갱신
+    import time as _time
+    _time.sleep(5)
+    st.rerun()
 
 
 if __name__ == "__main__":

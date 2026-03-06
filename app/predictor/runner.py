@@ -6,47 +6,57 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from app.config import Settings
 from app.db.writer import upsert_prediction
-from app.models.baseline_v1 import BaselineModelV1
 from app.models.interface import BaseModel
 
 log = logging.getLogger(__name__)
 
+# ── GCP 원천 데이터 쿼리 (alt 피처: Binance + Macro) ──────────────────────────
+_FETCH_GCP_BINANCE_SQL = text("""
+SELECT funding_rate, long_short_ratio, open_interest
+FROM binance_derivatives
+ORDER BY timestamp DESC LIMIT 1
+""")
+
+_FETCH_GCP_MACRO_SQL = text("""
+SELECT dxy_index, fear_greed_index
+FROM macro_and_sentiment
+ORDER BY timestamp DESC LIMIT 1
+""")
+
+_FETCH_GCP_TICK_SQL = text("""
+SELECT
+    SUM(CASE WHEN ask_bid = 'ASK' THEN volume ELSE 0 END)
+    / NULLIF(SUM(volume), 0) AS buy_volume_ratio
+FROM upbit_tick
+WHERE timestamp >= now() AT TIME ZONE 'UTC' - interval '60 seconds'
+""")
+
 
 def create_model(settings: Settings) -> BaseModel:
-    """PREDICTOR_TYPE 설정에 따라 모델 인스턴스를 생성하는 팩토리.
+    """ACTIVE_MODEL 식별자를 ModelFactory에 전달해 모델 인스턴스를 반환한다.
 
-    PREDICTOR_TYPE 값:
-      baseline (기본)  — BaselineModelV1 (규칙 기반)
-      ridge            — RidgePredictor  (선형 Ridge+Scaler)
-      hgbr             — HGBRPredictor   (비선형 HistGradientBoosting)
+    .env 에서 ACTIVE_MODEL=ridge_h3600 한 줄만 바꾸면
+    모델 클래스·경로·gamma·version이 자동으로 결정된다.
+
+    등록 가능한 모델::
+
+        ridge_h3600  ridge_h600  ridge_h120
+        hgbr_h600    hgbr_h120   baseline_v1
     """
-    ptype = (settings.PREDICTOR_TYPE or "baseline").lower()
-
-    if ptype == "ridge":
-        from app.predictor.ml_model import RidgePredictor
-        model_path = settings.RIDGE_MODEL_PATH
-        model = RidgePredictor(model_path=model_path, h_sec=settings.H_SEC)
-        log.info("create_model: RidgePredictor 선택 (path=%s, h_sec=%d)",
-                 model_path or f"artifacts/ml1/h{settings.H_SEC}/ridge_model.joblib",
-                 settings.H_SEC)
-        return model
-
-    if ptype == "hgbr":
-        from app.predictor.ml_model import HGBRPredictor
-        model_path = settings.RIDGE_MODEL_PATH  # 동일 설정 키 재사용 (경로만 다름)
-        model = HGBRPredictor(model_path=model_path, h_sec=settings.H_SEC)
-        log.info("create_model: HGBRPredictor 선택 (path=%s, h_sec=%d)",
-                 model_path or f"artifacts/ml1/h{settings.H_SEC}/ridge_model.joblib",
-                 settings.H_SEC)
-        return model
-
-    log.info("create_model: BaselineModelV1 선택")
-    return BaselineModelV1()
+    from app.predictor.ml_model import ModelFactory
+    model_id = settings.ACTIVE_MODEL
+    model = ModelFactory.create(model_id)
+    spec = ModelFactory.get_spec(model_id)
+    log.info(
+        "create_model: ACTIVE_MODEL=%s → %s (h_sec=%d gamma=%.1f version=%s)",
+        model_id, type(model).__name__, spec.h_sec, spec.gamma, spec.version,
+    )
+    return model
 
 _FETCH_BARRIER_SQL = text("""
 SELECT ts, symbol, h_sec, r_t, sigma_1s, sigma_h, status
@@ -68,6 +78,52 @@ class PredictionRunner:
         self.settings = settings
         self.engine = engine
         self.model = model
+        # GCP DB 엔진 (alt 피처 조회용) — GCP_DB_URL 없으면 None
+        self._gcp_engine: Engine | None = None
+        if settings.GCP_DB_URL:
+            try:
+                self._gcp_engine = create_engine(settings.GCP_DB_URL, pool_pre_ping=True)
+                log.info("PredictionRunner: GCP 엔진 초기화 완료 (alt 피처 조회)")
+            except Exception:
+                log.warning("PredictionRunner: GCP 엔진 초기화 실패 — alt 피처 0.0 폴백")
+
+    def fetch_alt_row(self) -> dict:
+        """GCP DB에서 최신 alt 피처(Binance/Macro/Tick)를 조회. 실패 시 0.0 폴백."""
+        result: dict = {
+            "funding_rate": 0.0,
+            "long_short_ratio": 0.0,
+            "open_interest": 0.0,
+            "dxy_index": 0.0,
+            "fear_greed_index": 0.0,
+            "buy_volume_ratio": 0.0,
+        }
+        if self._gcp_engine is None:
+            return result
+        try:
+            with self._gcp_engine.connect() as conn:
+                row = conn.execute(_FETCH_GCP_BINANCE_SQL).fetchone()
+                if row:
+                    result["funding_rate"] = float(row.funding_rate or 0.0)
+                    result["long_short_ratio"] = float(row.long_short_ratio or 0.0)
+                    result["open_interest"] = float(row.open_interest or 0.0)
+        except Exception:
+            log.debug("PredictionRunner: GCP binance_derivatives 조회 실패")
+        try:
+            with self._gcp_engine.connect() as conn:
+                row = conn.execute(_FETCH_GCP_MACRO_SQL).fetchone()
+                if row:
+                    result["dxy_index"] = float(row.dxy_index or 0.0)
+                    result["fear_greed_index"] = float(row.fear_greed_index or 0.0)
+        except Exception:
+            log.debug("PredictionRunner: GCP macro_and_sentiment 조회 실패")
+        try:
+            with self._gcp_engine.connect() as conn:
+                row = conn.execute(_FETCH_GCP_TICK_SQL).fetchone()
+                if row and row.buy_volume_ratio is not None:
+                    result["buy_volume_ratio"] = float(row.buy_volume_ratio)
+        except Exception:
+            log.debug("PredictionRunner: GCP upbit_tick 조회 실패")
+        return result
 
     def fetch_latest_barrier(self, symbol: str, t0: datetime) -> dict | None:
         with self.engine.connect() as conn:
@@ -91,6 +147,10 @@ class PredictionRunner:
         if barrier_row is None:
             log.warning("Pred: no barrier_state row found for t0=%s, skipping", t0)
             return
+
+        # alt 피처(Binance/Macro/Tick)를 GCP에서 조회하여 barrier_row에 병합
+        alt_row = self.fetch_alt_row()
+        barrier_row = {**barrier_row, **alt_row}
 
         market_window = self.fetch_market_window(symbol, t0)
 

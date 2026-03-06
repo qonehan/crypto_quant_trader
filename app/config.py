@@ -1,6 +1,17 @@
 from typing import Optional
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# ACTIVE_MODEL 별 자동 동기화 호흡(초) — ml_model._REGISTRY와 일치 유지
+_ACTIVE_MODEL_HORIZON: dict[str, int] = {
+    "ridge_h3600": 3600,
+    "ridge_h600":  600,
+    "ridge_h120":  120,
+    "hgbr_h600":   600,
+    "hgbr_h120":   120,
+    "baseline_v1": 120,
+}
 
 
 class Settings(BaseSettings):
@@ -16,7 +27,7 @@ class Settings(BaseSettings):
     UPBIT_NO_MESSAGE_TIMEOUT_SEC: float = 30
 
     DECISION_INTERVAL_SEC: int = 5
-    H_SEC: int = 120
+    H_SEC: int = 3600
     VOL_WINDOW_SEC: int = 600
 
     R_MIN: float = 0.0010
@@ -31,7 +42,7 @@ class Settings(BaseSettings):
     K_VOL_MAX: float = 2.00
     VOL_DT_SEC: int = 5
 
-    MODEL_LOOKBACK_SEC: int = 120
+    MODEL_LOOKBACK_SEC: int = 3600
     FEE_RATE: float = 0.0005
     SLIPPAGE_BPS: float = 2
     EV_COST_MULT: float = 1.0
@@ -121,8 +132,22 @@ class Settings(BaseSettings):
     GCP_DB_URL: Optional[str] = None
 
     # ── Predictor ──────────────────────────────────────────────────
-    PREDICTOR_TYPE: str = "baseline"   # baseline | ridge
-    RIDGE_MODEL_PATH: str = ""         # 빈 문자열이면 artifacts/ml1/h{H_SEC}/ridge_model.joblib 사용
+    # ACTIVE_MODEL 하나만 바꾸면 모델·호흡·gamma가 자동 결정됩니다.
+    ACTIVE_MODEL: str = "ridge_h3600"  # 레지스트리 키 (ml_model._REGISTRY 참조)
+
+    # 하위 호환용 — ACTIVE_MODEL 미설정 환경에서만 사용
+    PREDICTOR_TYPE: str = "ridge"
+    RIDGE_MODEL_PATH: str = "artifacts/ml_prod/h3600/historical_dataset_ridge/ridge_model.joblib"
+    RIDGE_GAMMA: float = 1.5
+
+    @model_validator(mode="after")
+    def _sync_horizon_from_active_model(self) -> "Settings":
+        """ACTIVE_MODEL에 매핑된 h_sec을 H_SEC / MODEL_LOOKBACK_SEC에 자동 반영."""
+        h = _ACTIVE_MODEL_HORIZON.get(self.ACTIVE_MODEL)
+        if h is not None:
+            object.__setattr__(self, "H_SEC", h)
+            object.__setattr__(self, "MODEL_LOOKBACK_SEC", h)
+        return self
 
     # ── Alt Data (Binance / Coinglass) ─────────────────────────────
     ALT_DATA_ENABLED: bool = False
