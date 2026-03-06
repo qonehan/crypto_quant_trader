@@ -5,13 +5,16 @@ build_historical_dataset.py — GCP 원천 데이터 기반 일괄 학습 데이
   poetry run python scripts/build_historical_dataset.py --hours 48
   poetry run python scripts/build_historical_dataset.py --hours 24 --horizon 120 --predict-interval 5
   poetry run python scripts/build_historical_dataset.py --hours 72 --output data/datasets/hist_72h.parquet
+  poetry run python scripts/build_historical_dataset.py --hours 72 --backup-dir data/backups
 
 흐름:
-  1. GCP upbit_orderbook 로드 (최근 --hours 시간)
-  2. 1초 리샘플링: mid, spread_bps, imb_notional_top5 계산
+  1. 4대 원천 데이터 하이브리드 로드 (백업 Parquet 우선, GCP DB 보완):
+     - upbit_orderbook  → mid, spread_bps, imb_notional_top5, cost_roundtrip_est
+     - upbit_tick       → buy_volume_ratio (매수 우위 비율)
+     - binance          → funding_rate, long_short_ratio, open_interest
+     - macro            → dxy_index, fear_greed_index
+  2. 1초 리샘플링 및 피처 엔지니어링 후 Left-join 병합
   3. 시뮬레이션 루프: 매 predict_interval_sec마다 BaselineModelV1.predict() 호출
-     - rolling vol_window(600s)로 sigma_1s 실시간 계산
-     - market_window(120s)로 model에 컨텍스트 공급
   4. 라벨링: merge_asof(direction='forward') → label_return 계산
   5. Parquet(또는 CSV) 저장
 """
@@ -35,13 +38,14 @@ from app.models.baseline_v1 import BaselineModelV1
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 _EPS = 1e-12
 
-# GCP upbit_orderbook 쿼리: Level 1 + orderbook_imbalance 전용 스키마
+# ── SQL 쿼리 ──────────────────────────────────────────────────────────────────
+
 _LOAD_ORDERBOOK_SQL = text("""
     SELECT
         timestamp AS ts,
         (level_1_bid_price + level_1_ask_price) / 2.0 AS mid,
         level_1_ask_price - level_1_bid_price          AS spread_raw,
-        orderbook_imbalance
+        orderbook_imbalance                            AS imb_notional_top5
     FROM upbit_orderbook
     WHERE level_1_bid_price IS NOT NULL
       AND level_1_ask_price IS NOT NULL
@@ -50,56 +54,431 @@ _LOAD_ORDERBOOK_SQL = text("""
     ORDER BY timestamp
 """)
 
+_LOAD_TICK_SQL = text("""
+    SELECT
+        timestamp AS ts,
+        price,
+        volume,
+        ask_bid
+    FROM upbit_tick
+    WHERE timestamp >= :t_min
+      AND timestamp <= :t_max
+    ORDER BY timestamp
+""")
 
-# ── 1. GCP 원천 데이터 로드 ────────────────────────────────────────────────────
+# binance_derivatives 단일 테이블 쿼리
+_LOAD_BINANCE_SQL = text("""
+    SELECT
+        timestamp AS ts,
+        open_interest,
+        long_short_ratio,
+        funding_rate
+    FROM binance_derivatives
+    WHERE timestamp >= :t_min
+      AND timestamp <= :t_max
+    ORDER BY timestamp
+""")
 
-def load_orderbook(engine, t_min: datetime, t_max: datetime) -> pd.DataFrame:
-    """upbit_orderbook에서 raw tick 데이터 로드."""
-    with engine.connect() as conn:
-        df = pd.read_sql(
-            _LOAD_ORDERBOOK_SQL,
-            conn,
-            params={"t_min": t_min, "t_max": t_max},
-        )
-    if df.empty:
-        return df
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    return df
+_LOAD_MACRO_SQL = text("""
+    SELECT
+        timestamp AS ts,
+        dxy_index,
+        fear_greed_index
+    FROM macro_and_sentiment
+    WHERE timestamp >= :t_min
+      AND timestamp <= :t_max
+    ORDER BY timestamp
+""")
 
 
-# ── 2. 1초 리샘플링 + 파생 지표 ────────────────────────────────────────────────
+# ── 공통 날짜 리스트 생성 헬퍼 ─────────────────────────────────────────────────
 
-def resample_1s(raw: pd.DataFrame) -> pd.DataFrame:
+def _date_range(t_min: datetime, t_max: datetime) -> list:
+    """t_min ~ t_max 범위의 UTC date 리스트 반환."""
+    t_min_utc = t_min.astimezone(timezone.utc) if t_min.tzinfo else t_min.replace(tzinfo=timezone.utc)
+    t_max_utc = t_max.astimezone(timezone.utc) if t_max.tzinfo else t_max.replace(tzinfo=timezone.utc)
+    dates = []
+    cur = t_min_utc.date()
+    end = t_max_utc.date()
+    while cur <= end:
+        dates.append(cur)
+        cur += timedelta(days=1)
+    return dates
+
+
+def _utc(dt: datetime) -> datetime:
+    return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _read_parquet_days(
+    backup_root: Path,
+    file_name: str,
+    all_dates: list,
+    t_min: datetime,
+    t_max: datetime,
+    ts_col: str = "ts",
+) -> list[pd.DataFrame]:
+    """날짜별 백업 Parquet을 읽어 list로 반환. ts_col을 UTC ts로 변환하고 기간 자르기."""
+    frames = []
+    for day in all_dates:
+        path = backup_root / day.strftime("%Y-%m-%d") / file_name
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                continue
+            if "timestamp" in df.columns and ts_col not in df.columns:
+                df = df.rename(columns={"timestamp": ts_col})
+            df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+            df = df[(df[ts_col] >= t_min) & (df[ts_col] <= t_max)]
+            if not df.empty:
+                frames.append(df)
+                print(f"    [backup] {path}  {len(df):,} rows")
+        except Exception as exc:
+            print(f"    [backup] WARNING: {path} 읽기 실패 — {exc}")
+    return frames
+
+
+def _merge_and_dedup(frames: list[pd.DataFrame], ts_col: str = "ts") -> pd.DataFrame:
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.sort_values(ts_col).drop_duplicates(subset=[ts_col]).reset_index(drop=True)
+    return combined
+
+
+# ── 1. 하이브리드 데이터 로드 함수들 ───────────────────────────────────────────
+
+def load_orderbook(
+    engine,
+    t_min: datetime,
+    t_max: datetime,
+    backup_dir: str = "data/backups",
+) -> pd.DataFrame:
     """
-    tick DataFrame → 1초 캔들 변환.
-
-    반환 컬럼: ts (index→column), mid, spread_bps, imb_notional_top5
-    orderbook_imbalance 컬럼을 imb_notional_top5로 직접 매핑.
+    upbit_orderbook: 백업 Parquet + GCP DB 하이브리드 로드.
+    반환 컬럼: ts, mid, spread_raw, imb_notional_top5
     """
-    raw = raw.copy()
+    backup_root = Path(backup_dir)
+    t_min_utc, t_max_utc = _utc(t_min), _utc(t_max)
+    all_dates = _date_range(t_min, t_max)
 
-    # spread_bps: spread_raw / mid * 10000
-    raw["spread_bps"] = (
-        raw["spread_raw"] / raw["mid"].where(raw["mid"] > 0, other=_EPS) * 10_000
+    # ── 백업 Parquet ──────────────────────────────────────────────────────────
+    parquet_frames: list[pd.DataFrame] = []
+    for day in all_dates:
+        path = backup_root / day.strftime("%Y-%m-%d") / "upbit_orderbook.parquet"
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                continue
+            if "timestamp" in df.columns:
+                df = df.rename(columns={"timestamp": "ts"})
+            df["ts"] = pd.to_datetime(df["ts"], utc=True)
+            df["mid"] = (df["level_1_bid_price"] + df["level_1_ask_price"]) / 2.0
+            if "orderbook_imbalance" in df.columns:
+                df = df.rename(columns={"orderbook_imbalance": "imb_notional_top5"})
+            df["spread_raw"] = df["level_1_ask_price"] - df["level_1_bid_price"]
+            df = df[df["level_1_bid_price"].notna() & df["level_1_ask_price"].notna()]
+            df = df[(df["ts"] >= t_min_utc) & (df["ts"] <= t_max_utc)]
+            if not df.empty:
+                parquet_frames.append(df[["ts", "mid", "spread_raw", "imb_notional_top5"]])
+                print(f"    [backup] {path}  {len(df):,} rows")
+        except Exception as exc:
+            print(f"    [backup] WARNING: {path} 읽기 실패 — {exc}")
+
+    # ── GCP DB ────────────────────────────────────────────────────────────────
+    db_df = pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            db_df = pd.read_sql(_LOAD_ORDERBOOK_SQL, conn,
+                                params={"t_min": t_min_utc, "t_max": t_max_utc})
+        if not db_df.empty:
+            db_df["ts"] = pd.to_datetime(db_df["ts"], utc=True)
+            print(f"    [db]     {len(db_df):,} rows from GCP DB (orderbook)")
+    except Exception as exc:
+        print(f"    [db]     WARNING: GCP DB 쿼리 실패 (orderbook) — {exc}")
+
+    frames = parquet_frames + ([db_df] if not db_df.empty else [])
+    return _merge_and_dedup(frames)
+
+
+def load_tick(
+    engine,
+    t_min: datetime,
+    t_max: datetime,
+    backup_dir: str = "data/backups",
+) -> pd.DataFrame:
+    """
+    upbit_tick: 백업 Parquet + GCP DB 하이브리드 로드.
+    반환 컬럼: ts, price, volume, ask_bid
+    """
+    backup_root = Path(backup_dir)
+    t_min_utc, t_max_utc = _utc(t_min), _utc(t_max)
+    all_dates = _date_range(t_min, t_max)
+
+    # ── 백업 Parquet ──────────────────────────────────────────────────────────
+    raw_frames = _read_parquet_days(backup_root, "upbit_tick.parquet", all_dates,
+                                    t_min_utc, t_max_utc, ts_col="ts")
+
+    # ── GCP DB ────────────────────────────────────────────────────────────────
+    db_df = pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            db_df = pd.read_sql(_LOAD_TICK_SQL, conn,
+                                params={"t_min": t_min_utc, "t_max": t_max_utc})
+        if not db_df.empty:
+            db_df["ts"] = pd.to_datetime(db_df["ts"], utc=True)
+            print(f"    [db]     {len(db_df):,} rows from GCP DB (tick)")
+    except Exception as exc:
+        print(f"    [db]     WARNING: GCP DB 쿼리 실패 (tick) — {exc}")
+
+    frames = raw_frames + ([db_df] if not db_df.empty else [])
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.sort_values("ts").reset_index(drop=True)
+    # tick은 ts 중복 허용 (동일 초에 여러 체결)
+    return combined
+
+
+def load_binance(
+    engine,
+    t_min: datetime,
+    t_max: datetime,
+    backup_dir: str = "data/backups",
+) -> pd.DataFrame:
+    """
+    Binance 파생 데이터: 백업 Parquet + GCP DB 하이브리드 로드.
+    DB 테이블: binance_derivatives (timestamp, open_interest, long_short_ratio, funding_rate)
+    백업 파일: binance_derivatives.parquet
+    반환 컬럼: ts, funding_rate, long_short_ratio, open_interest
+    """
+    backup_root = Path(backup_dir)
+    t_min_utc, t_max_utc = _utc(t_min), _utc(t_max)
+    all_dates = _date_range(t_min, t_max)
+
+    # ── 백업 Parquet ──────────────────────────────────────────────────────────
+    raw_frames = _read_parquet_days(backup_root, "binance_derivatives.parquet",
+                                    all_dates, t_min_utc, t_max_utc, ts_col="ts")
+
+    # ── GCP DB ────────────────────────────────────────────────────────────────
+    db_df = pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            db_df = pd.read_sql(_LOAD_BINANCE_SQL, conn,
+                                params={"t_min": t_min_utc, "t_max": t_max_utc})
+        if not db_df.empty:
+            db_df["ts"] = pd.to_datetime(db_df["ts"], utc=True)
+            print(f"    [db]     {len(db_df):,} rows from GCP DB (binance_derivatives)")
+    except Exception as exc:
+        print(f"    [db]     WARNING: GCP DB 쿼리 실패 (binance_derivatives) — {exc}")
+
+    frames = raw_frames + ([db_df] if not db_df.empty else [])
+    result = _merge_and_dedup(frames)
+    if result.empty:
+        return pd.DataFrame()
+
+    for col in ("funding_rate", "long_short_ratio", "open_interest"):
+        if col not in result.columns:
+            result[col] = float("nan")
+
+    return result[["ts", "funding_rate", "long_short_ratio", "open_interest"]].copy()
+
+
+def load_macro(
+    engine,
+    t_min: datetime,
+    t_max: datetime,
+    backup_dir: str = "data/backups",
+) -> pd.DataFrame:
+    """
+    Macro 데이터: 백업 Parquet + GCP DB 하이브리드 로드.
+    반환 컬럼: ts, dxy_index, fear_greed_index
+    """
+    backup_root = Path(backup_dir)
+    t_min_utc, t_max_utc = _utc(t_min), _utc(t_max)
+    all_dates = _date_range(t_min, t_max)
+
+    # ── 백업 Parquet ──────────────────────────────────────────────────────────
+    raw_frames = _read_parquet_days(backup_root, "macro_and_sentiment.parquet", all_dates,
+                                    t_min_utc, t_max_utc, ts_col="ts")
+
+    # ── GCP DB ────────────────────────────────────────────────────────────────
+    db_df = pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            db_df = pd.read_sql(_LOAD_MACRO_SQL, conn,
+                                params={"t_min": t_min_utc, "t_max": t_max_utc})
+        if not db_df.empty:
+            db_df["ts"] = pd.to_datetime(db_df["ts"], utc=True)
+            print(f"    [db]     {len(db_df):,} rows from GCP DB (macro)")
+    except Exception as exc:
+        print(f"    [db]     WARNING: GCP DB 쿼리 실패 (macro) — {exc}")
+
+    frames = raw_frames + ([db_df] if not db_df.empty else [])
+    result = _merge_and_dedup(frames)
+    if result.empty:
+        return pd.DataFrame()
+
+    for col in ("dxy_index", "fear_greed_index"):
+        if col not in result.columns:
+            result[col] = float("nan")
+
+    return result[["ts", "dxy_index", "fear_greed_index"]].copy()
+
+
+# ── 2. 리샘플링 헬퍼 함수 ──────────────────────────────────────────────────────
+
+def _resample_tick_1s(raw_tick: pd.DataFrame) -> pd.DataFrame:
+    """
+    tick raw → 1초 집계.
+    반환 컬럼: ts, total_volume, buy_volume, sell_volume, buy_volume_ratio
+    빈 구간은 0으로 채움.
+    ask_bid == 'ASK' → 매수 체결 (업비트 컨벤션: ASK = 시장 매수)
+    """
+    if raw_tick.empty:
+        return pd.DataFrame()
+
+    df = raw_tick.copy()
+    df["is_buy"] = (df["ask_bid"].str.upper() == "ASK").astype(float)
+    df["buy_vol"] = df["volume"] * df["is_buy"]
+    df = df.set_index("ts")
+
+    agg = df[["volume", "buy_vol"]].resample("1s").sum()
+    agg.columns = ["total_volume", "buy_volume"]
+    agg["sell_volume"] = agg["total_volume"] - agg["buy_volume"]
+    agg["buy_volume_ratio"] = agg["buy_volume"] / agg["total_volume"].where(
+        agg["total_volume"] > 0, other=float("nan")
     )
 
-    # orderbook_imbalance → imb_notional_top5 매핑
-    raw["imb_notional_top5"] = raw["orderbook_imbalance"].fillna(0.0)
+    # 거래 없는 구간: 0으로 채움
+    agg = agg.fillna({"total_volume": 0.0, "buy_volume": 0.0,
+                       "sell_volume": 0.0, "buy_volume_ratio": 0.0})
+    return agg.reset_index()
 
-    raw = raw.set_index("ts")
 
-    agg = raw[["mid", "spread_bps", "imb_notional_top5"]].resample("1s").agg({
+def _resample_binance_1s(raw_binance: pd.DataFrame, index_ts: pd.Series) -> pd.DataFrame:
+    """
+    binance 파생 데이터 → 1초 단위 ffill 리샘플링.
+    반환 컬럼: ts, funding_rate, long_short_ratio, open_interest
+    """
+    if raw_binance.empty:
+        return pd.DataFrame()
+
+    df = raw_binance.set_index("ts")
+    # 1초 기준으로 리인덱스 후 ffill
+    df = df.resample("1s").last().ffill()
+    return df.reset_index()
+
+
+def _resample_macro_1s(raw_macro: pd.DataFrame) -> pd.DataFrame:
+    """
+    macro 데이터 → 1초 단위 ffill 리샘플링.
+    반환 컬럼: ts, dxy_index, fear_greed_index
+    """
+    if raw_macro.empty:
+        return pd.DataFrame()
+
+    df = raw_macro.set_index("ts")
+    df = df.resample("1s").last().ffill()
+    return df.reset_index()
+
+
+# ── 3. 통합 1초 리샘플링 + 4대 소스 병합 ──────────────────────────────────────
+
+def resample_1s(
+    raw: pd.DataFrame,
+    raw_tick: pd.DataFrame | None = None,
+    raw_binance: pd.DataFrame | None = None,
+    raw_macro: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    4대 원천 tick DataFrame → 1초 캔들 변환 및 병합.
+
+    주축(Left): Orderbook 기반 1초 캔들
+    Right-join:  Tick, Binance, Macro (merge_asof direction='backward', 이후 bfill)
+
+    반환 컬럼:
+      ts, mid, spread_bps, imb_notional_top5, cost_roundtrip_est,
+      total_volume, buy_volume, sell_volume, buy_volume_ratio,
+      funding_rate, long_short_ratio, open_interest,
+      dxy_index, fear_greed_index
+    """
+    # ── Orderbook 1초 캔들 ────────────────────────────────────────────────────
+    ob = raw.copy()
+
+    ob["spread_bps"] = (
+        ob["spread_raw"] / ob["mid"].where(ob["mid"] > 0, other=_EPS) * 10_000
+    )
+    ob["imb_notional_top5"] = ob["imb_notional_top5"].fillna(0.0)
+    ob["cost_roundtrip_est"] = (
+        ob["spread_raw"] / ob["mid"].where(ob["mid"] > 0, other=_EPS)
+    ) + 0.001
+
+    ob = ob.set_index("ts")
+    agg = ob[["mid", "spread_bps", "imb_notional_top5", "cost_roundtrip_est"]].resample("1s").agg({
         "mid": "last",
         "spread_bps": "mean",
         "imb_notional_top5": "mean",
+        "cost_roundtrip_est": "mean",
     })
+    agg = agg.ffill().reset_index()  # 주축 캔들
 
-    agg = agg.ffill()      # 빈 1초 구간을 직전 값으로 보간
-    agg = agg.reset_index()  # ts를 컬럼으로 복원
-    return agg
+    # ── Tick 1초 집계 ─────────────────────────────────────────────────────────
+    tick_1s = _resample_tick_1s(raw_tick) if raw_tick is not None and not raw_tick.empty else pd.DataFrame()
+
+    # ── Binance 1초 ffill ──────────────────────────────────────────────────────
+    binance_1s = (_resample_binance_1s(raw_binance, agg["ts"])
+                  if raw_binance is not None and not raw_binance.empty else pd.DataFrame())
+
+    # ── Macro 1초 ffill ────────────────────────────────────────────────────────
+    macro_1s = (_resample_macro_1s(raw_macro)
+                if raw_macro is not None and not raw_macro.empty else pd.DataFrame())
+
+    # ── Left-join: orderbook 기준으로 Tick, Binance, Macro 병합 ───────────────
+    result = agg.sort_values("ts").reset_index(drop=True)
+
+    if not tick_1s.empty:
+        tick_1s = tick_1s.sort_values("ts").reset_index(drop=True)
+        result = pd.merge_asof(result, tick_1s, on="ts", direction="backward")
+    else:
+        result["total_volume"] = 0.0
+        result["buy_volume"] = 0.0
+        result["sell_volume"] = 0.0
+        result["buy_volume_ratio"] = 0.0
+
+    if not binance_1s.empty:
+        binance_1s = binance_1s.sort_values("ts").reset_index(drop=True)
+        result = pd.merge_asof(result, binance_1s, on="ts", direction="backward")
+    else:
+        result["funding_rate"] = float("nan")
+        result["long_short_ratio"] = float("nan")
+        result["open_interest"] = float("nan")
+
+    if not macro_1s.empty:
+        macro_1s = macro_1s.sort_values("ts").reset_index(drop=True)
+        result = pd.merge_asof(result, macro_1s, on="ts", direction="backward")
+    else:
+        result["dxy_index"] = float("nan")
+        result["fear_greed_index"] = float("nan")
+
+    # ── NaN 보간: 초반 결측치 bfill → 나머지 기본값 ────────────────────────────
+    tick_cols = ["total_volume", "buy_volume", "sell_volume", "buy_volume_ratio"]
+    binance_cols = ["funding_rate", "long_short_ratio", "open_interest"]
+    macro_cols = ["dxy_index", "fear_greed_index"]
+
+    result[tick_cols] = result[tick_cols].bfill().fillna(0.0)
+    result[binance_cols] = result[binance_cols].bfill().fillna(0.0)
+    result[macro_cols] = result[macro_cols].bfill().fillna(0.0)
+
+    return result
 
 
-# ── 3. sigma_1s 인라인 계산 (rolling) ─────────────────────────────────────────
+# ── 4. sigma_1s 인라인 계산 (rolling) ─────────────────────────────────────────
 
 def _compute_sigma_1s(mids: list[float], vol_dt_sec: int) -> float | None:
     """vol_window 내 mid로부터 sigma_1s 계산."""
@@ -150,7 +529,7 @@ def _build_barrier_row(
     }
 
 
-# ── 4. 시뮬레이션 루프 ─────────────────────────────────────────────────────────
+# ── 5. 시뮬레이션 루프 ─────────────────────────────────────────────────────────
 
 def run_simulation(
     candles: pd.DataFrame,
@@ -159,8 +538,8 @@ def run_simulation(
 ) -> pd.DataFrame:
     """
     1초 캔들을 시간순으로 순회하며 BaselineModelV1.predict()를 호출.
-
     predict_interval_sec 마다 예측을 수행하고 결과를 rows 리스트로 반환.
+    4대 원천 피처(orderbook + tick + binance + macro) 모두 출력에 포함.
     """
     model = BaselineModelV1()
 
@@ -169,23 +548,33 @@ def run_simulation(
     vol_dt_sec = max(1, settings.VOL_DT_SEC)
     warmup_threshold = max(30, int((vol_window_sec / vol_dt_sec) * 0.3))
 
-    # rolling deques
     market_window: deque[dict] = deque(maxlen=model_lookback)
     vol_window: deque[float] = deque(maxlen=vol_window_sec)
 
+    # 새 컬럼이 없을 경우를 대비한 safe getter
+    def _fval(row, col, default=0.0):
+        return float(row[col]) if col in row.index and pd.notna(row[col]) else default
+
     rows = []
     step = 0
-
     total = len(candles)
     print(f"  총 {total:,} 스텝 순회 시작 (predict_interval={predict_interval_sec}s) ...")
 
     for _, row in candles.iterrows():
         ts: datetime = row["ts"]
-        mid: float = float(row["mid"]) if pd.notna(row["mid"]) else 0.0
-        spread_bps: float = float(row["spread_bps"]) if pd.notna(row["spread_bps"]) else 0.0
-        imb: float = float(row["imb_notional_top5"]) if pd.notna(row["imb_notional_top5"]) else 0.0
+        mid: float = _fval(row, "mid", 0.0)
+        spread_bps: float = _fval(row, "spread_bps", 0.0)
+        imb: float = _fval(row, "imb_notional_top5", 0.0)
+        cost_rt: float = _fval(row, "cost_roundtrip_est", 0.001)
 
-        # market_window 엔트리 (PredictionRunner와 동일한 키 구조)
+        # 새 피처
+        buy_vol_ratio: float = _fval(row, "buy_volume_ratio", 0.0)
+        funding_rate: float = _fval(row, "funding_rate", 0.0)
+        long_short_ratio: float = _fval(row, "long_short_ratio", 0.0)
+        open_interest: float = _fval(row, "open_interest", 0.0)
+        dxy_index: float = _fval(row, "dxy_index", 0.0)
+        fear_greed_index: float = _fval(row, "fear_greed_index", 0.0)
+
         entry = {
             "ts": ts,
             "mid": mid,
@@ -202,14 +591,11 @@ def run_simulation(
 
         step += 1
 
-        # predict_interval_sec 마다 예측
         if step % predict_interval_sec != 0:
             continue
 
         sigma_1s = _compute_sigma_1s(list(vol_window), vol_dt_sec)
-        barrier_row = _build_barrier_row(
-            ts, sigma_1s, len(vol_window), warmup_threshold, settings
-        )
+        barrier_row = _build_barrier_row(ts, sigma_1s, len(vol_window), warmup_threshold, settings)
 
         output = model.predict(
             market_window=list(market_window),
@@ -234,15 +620,25 @@ def run_simulation(
             "mom_z": output.mom_z,
             "spread_bps": output.spread_bps,
             "imb_notional_top5": output.imb_notional_top5,
+            "cost_roundtrip_est": cost_rt,
             "action_hat": output.action_hat,
             "model_version": output.model_version,
+            # tick 피처
+            "buy_volume_ratio": buy_vol_ratio,
+            # binance 피처
+            "funding_rate": funding_rate,
+            "long_short_ratio": long_short_ratio,
+            "open_interest": open_interest,
+            # macro 피처
+            "dxy_index": dxy_index,
+            "fear_greed_index": fear_greed_index,
         })
 
     print(f"  시뮬레이션 완료: {len(rows):,} 예측 행 생성")
     return pd.DataFrame(rows)
 
 
-# ── 5. 라벨 생성 (export_dataset.py와 동일 방식) ──────────────────────────────
+# ── 6. 라벨 생성 (export_dataset.py와 동일 방식) ──────────────────────────────
 
 def generate_labels(
     features: pd.DataFrame,
@@ -267,7 +663,6 @@ def generate_labels(
     features_sorted = features.sort_values("t0_plus_h").reset_index(drop=True)
     prices_sorted = prices.sort_values("ts").reset_index(drop=True)
 
-    # 미래 가격 매칭
     merged = pd.merge_asof(
         features_sorted,
         prices_sorted.rename(columns={"ts": "label_ts", "mid": "future_mid"}),
@@ -276,7 +671,6 @@ def generate_labels(
         direction="forward",
     )
 
-    # 진입 가격 매칭
     merged = pd.merge_asof(
         merged.sort_values("ts"),
         prices_sorted.rename(columns={"ts": "price_ts", "mid": "entry_mid"}),
@@ -341,6 +735,9 @@ def main() -> int:
     parser.add_argument("--output", type=str,
                         default="data/datasets/historical_dataset.parquet",
                         help="출력 파일 경로")
+    parser.add_argument("--backup-dir", type=str,
+                        default="data/backups",
+                        help="로컬 백업 Parquet 루트 디렉터리 (기본: data/backups)")
     args = parser.parse_args()
 
     s = load_settings()
@@ -349,15 +746,15 @@ def main() -> int:
 
     sep = "=" * 60
     print(sep)
-    print("  Historical Dataset Builder (GCP 원천 데이터 기반)")
+    print("  Historical Dataset Builder (4대 원천 데이터 하이브리드)")
     print(f"  hours               = {args.hours}")
+    print(f"  backup_dir          = {args.backup_dir}")
     print(f"  horizon_sec         = {horizon_sec}")
     print(f"  predict_interval    = {args.predict_interval}s")
     print(f"  max_label_lag_sec   = {max_label_lag_sec}")
     print(f"  output              = {args.output}")
     print(sep)
 
-    # ── 엔진 생성 ─────────────────────────────────────────────────────────────
     if not s.GCP_DB_URL:
         print("  ERROR: GCP_DB_URL 환경변수가 설정되지 않았습니다.")
         return 1
@@ -369,20 +766,41 @@ def main() -> int:
     t_max = now_utc
     print(f"  query range: {t_min.strftime('%Y-%m-%d %H:%M')} ~ {t_max.strftime('%Y-%m-%d %H:%M')} UTC")
 
-    # ── Step 1: GCP 원천 데이터 로드 ──────────────────────────────────────────
-    print("\n[1] upbit_orderbook 로드 중...")
-    raw = load_orderbook(engine_gcp, t_min, t_max)
-    if raw.empty:
-        print("  ERROR: GCP에서 데이터를 가져오지 못했습니다.")
+    # ── Step 1: 4대 원천 데이터 하이브리드 로드 ───────────────────────────────
+    print("\n[1a] upbit_orderbook 로드 중...")
+    raw_ob = load_orderbook(engine_gcp, t_min, t_max, backup_dir=args.backup_dir)
+    if raw_ob.empty:
+        print("  ERROR: orderbook 데이터를 가져오지 못했습니다.")
         return 1
-    print(f"  raw ticks: {len(raw):,} rows  "
-          f"({raw['ts'].min()} ~ {raw['ts'].max()})")
+    print(f"  orderbook: {len(raw_ob):,} rows  ({raw_ob['ts'].min()} ~ {raw_ob['ts'].max()})")
 
-    # ── Step 2: 1초 리샘플링 ──────────────────────────────────────────────────
-    print("\n[2] 1초 리샘플링 중...")
-    candles = resample_1s(raw)
-    del raw  # 메모리 해제
-    print(f"  1s candles: {len(candles):,} rows")
+    print("\n[1b] upbit_tick 로드 중...")
+    raw_tick = load_tick(engine_gcp, t_min, t_max, backup_dir=args.backup_dir)
+    if raw_tick.empty:
+        print("  WARN: tick 데이터 없음 — buy_volume_ratio=0.0으로 대체")
+    else:
+        print(f"  tick: {len(raw_tick):,} rows")
+
+    print("\n[1c] Binance 파생 데이터 로드 중...")
+    raw_binance = load_binance(engine_gcp, t_min, t_max, backup_dir=args.backup_dir)
+    if raw_binance.empty:
+        print("  WARN: Binance 데이터 없음 — funding_rate/long_short_ratio/open_interest=0.0으로 대체")
+    else:
+        print(f"  binance: {len(raw_binance):,} rows")
+
+    print("\n[1d] Macro 데이터 로드 중...")
+    raw_macro = load_macro(engine_gcp, t_min, t_max, backup_dir=args.backup_dir)
+    if raw_macro.empty:
+        print("  WARN: Macro 데이터 없음 — dxy_index/fear_greed_index=0.0으로 대체")
+    else:
+        print(f"  macro: {len(raw_macro):,} rows")
+
+    # ── Step 2: 1초 리샘플링 + 4대 소스 병합 ──────────────────────────────────
+    print("\n[2] 1초 리샘플링 및 병합 중...")
+    candles = resample_1s(raw_ob, raw_tick=raw_tick,
+                          raw_binance=raw_binance, raw_macro=raw_macro)
+    del raw_ob, raw_tick, raw_binance, raw_macro
+    print(f"  1s candles: {len(candles):,} rows  columns: {list(candles.columns)}")
 
     # ── Step 3: 시뮬레이션 루프 ───────────────────────────────────────────────
     print("\n[3] 시뮬레이션 루프 (feature 계산)...")
@@ -393,10 +811,7 @@ def main() -> int:
 
     # ── Step 4: 라벨 생성 ─────────────────────────────────────────────────────
     print("\n[4] 라벨 생성 (merge_asof direction=forward)...")
-    # 라벨용 가격은 1초 캔들 (이미 리샘플링된 candles) 재활용
     prices = candles[["ts", "mid"]].copy()
-    # 라벨 horizon 이후 데이터가 필요하므로 상한을 여유 있게 설정 (이미 포함됨)
-
     dataset, drop_stats = generate_labels(features, prices, horizon_sec, max_label_lag_sec)
     if dataset.empty:
         print("  ERROR: 라벨 생성 후 데이터가 없습니다.")
@@ -424,6 +839,7 @@ def main() -> int:
         dataset.to_parquet(out_path, index=False)
 
     print(f"  Exported {len(dataset):,} rows → {out_path}")
+    print(f"  Columns ({len(dataset.columns)}): {list(dataset.columns)}")
 
     # ── 요약 ──────────────────────────────────────────────────────────────────
     print(f"\n  Drop summary:")

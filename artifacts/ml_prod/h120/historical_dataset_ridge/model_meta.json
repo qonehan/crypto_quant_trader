@@ -1,0 +1,28 @@
+{
+  "feature_cols": [
+    "r_t",
+    "sigma_1s",
+    "sigma_h",
+    "p_up",
+    "p_down",
+    "p_none",
+    "ev",
+    "ev_rate",
+    "z_barrier",
+    "mom_z",
+    "spread_bps",
+    "imb_notional_top5",
+    "buy_volume_ratio",
+    "funding_rate",
+    "long_short_ratio",
+    "open_interest",
+    "dxy_index",
+    "fear_greed_index",
+    "entry_mid"
+  ],
+  "time_col": "ts",
+  "model_type": "ridge",
+  "horizon_sec": 120,
+  "gamma_selected": 1.0,
+  "drop_pnone": false
+}

@@ -1,0 +1,142 @@
+{
+  "ridge": {
+    "input": "data/datasets/historical_dataset.parquet",
+    "horizon": 600,
+    "drop_pnone": false,
+    "features": [
+      "r_t",
+      "sigma_1s",
+      "sigma_h",
+      "p_up",
+      "p_down",
+      "p_none",
+      "ev",
+      "ev_rate",
+      "z_barrier",
+      "mom_z",
+      "spread_bps",
+      "imb_notional_top5",
+      "buy_volume_ratio",
+      "funding_rate",
+      "long_short_ratio",
+      "open_interest",
+      "dxy_index",
+      "fear_greed_index",
+      "entry_mid"
+    ],
+    "n_total": 14280,
+    "split": {
+      "train_end": 9996,
+      "valid_end": 12138,
+      "test_n": 2142
+    },
+    "metrics_test": {
+      "rmse": 0.00187099,
+      "rmse_naive0": 0.00192829,
+      "mae": 0.00159275,
+      "ic_pearson": 0.42174,
+      "sign_acc": 0.70962
+    },
+    "gamma_grid_valid": [
+      {
+        "gamma": 0.5,
+        "valid_n_trades": 18,
+        "valid_total_pnl_net": -0.017769660821582853
+      },
+      {
+        "gamma": 1.0,
+        "valid_n_trades": 14,
+        "valid_total_pnl_net": -0.00933711249687714
+      },
+      {
+        "gamma": 1.5,
+        "valid_n_trades": 11,
+        "valid_total_pnl_net": -0.004315778148542663
+      }
+    ],
+    "gamma_selected": {
+      "gamma": 1.5,
+      "valid_total_pnl_net": -0.00431578
+    },
+    "test_trades": {
+      "n": 10,
+      "long_n": 0,
+      "short_n": 10,
+      "win_rate_gross": 0.7,
+      "win_rate_net": 0.2,
+      "total_pnl_gross": 0.00710121,
+      "total_pnl_net": -0.00436045,
+      "avg_pnl_net_per_trade": -0.00043605
+    }
+  },
+  "hgbr": {
+    "input": "data/datasets/historical_dataset.parquet",
+    "horizon": 600,
+    "drop_pnone": false,
+    "features": [
+      "r_t",
+      "sigma_1s",
+      "sigma_h",
+      "p_up",
+      "p_down",
+      "p_none",
+      "ev",
+      "ev_rate",
+      "z_barrier",
+      "mom_z",
+      "spread_bps",
+      "imb_notional_top5",
+      "buy_volume_ratio",
+      "funding_rate",
+      "long_short_ratio",
+      "open_interest",
+      "dxy_index",
+      "fear_greed_index",
+      "entry_mid"
+    ],
+    "n_total": 14280,
+    "split": {
+      "train_end": 9996,
+      "valid_end": 12138,
+      "test_n": 2142
+    },
+    "metrics_test": {
+      "rmse": 0.0020035,
+      "rmse_naive0": 0.00192829,
+      "mae": 0.00150033,
+      "ic_pearson": -0.02449,
+      "sign_acc": 0.50747
+    },
+    "gamma_grid_valid": [
+      {
+        "gamma": 0.5,
+        "valid_n_trades": 17,
+        "valid_total_pnl_net": -0.008234509306925583
+      },
+      {
+        "gamma": 1.0,
+        "valid_n_trades": 12,
+        "valid_total_pnl_net": -0.014120853436121761
+      },
+      {
+        "gamma": 1.5,
+        "valid_n_trades": 7,
+        "valid_total_pnl_net": -0.00176849647314973
+      }
+    ],
+    "gamma_selected": {
+      "gamma": 1.5,
+      "valid_total_pnl_net": -0.0017685
+    },
+    "test_trades": {
+      "n": 0,
+      "long_n": 0,
+      "short_n": 0,
+      "win_rate_gross": 0.0,
+      "win_rate_net": 0.0,
+      "total_pnl_gross": 0.0,
+      "total_pnl_net": 0.0,
+      "avg_pnl_net_per_trade": null
+    }
+  }
+}
