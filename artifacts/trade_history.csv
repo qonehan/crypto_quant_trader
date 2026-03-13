@@ -1,0 +1,3 @@
+timestamp,action,entry_time,entry_price,entry_prob,exit_time,exit_price,exit_prob,ret_pct,held_min,reason,cum_trade_count,cum_pnl_pct
+2026-03-13 14:00:00,BUY,2026-03-13 14:00:00,128000000,0.5800,,,,,,,,
+2026-03-13 14:05:00,SELL,2026-03-13 14:00:00,128000000,0.5800,2026-03-13 14:05:00,128500000,0.4200,+0.3906,5,PROB_WEAK,1,+0.3906
