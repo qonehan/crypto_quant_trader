@@ -1,0 +1,8 @@
+{
+  "n_features": 67,
+  "d_model": 64,
+  "n_low": 2,
+  "n_high": 1,
+  "d_conv": 4,
+  "dropout": 0.1
+}
