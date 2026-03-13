@@ -1,15 +1,26 @@
 """
-Step DL-9: CryptoMambaClassifier GPU 학습 스크립트
+Step DL-9: CryptoMambaClassifier GPU 학습 스크립트  [v2 — 15분 타겟 이진 분류]
 
 학습 설정
 ──────────────────────────────────────────────────────────────────────────────
-  데이터셋  : btc_1m_hft_v2.parquet  (67피처 + future_ret_1 타겟)
+  데이터셋  : btc_1m_hft_v2.parquet  (67피처 + future_ret_15 타겟)
+  타겟 변환 : future_ret_15 > 0 → 1 (LONG), ≤ 0 → 0 (SHORT/FLAT)
   모델      : CryptoMambaClassifier  (DWT + Selective SSM + KAN Mixer)
-  손실함수  : GMADLoss (tau = std(future_ret_1) 동적 계산)
+  손실함수  : BCEWithLogitsLoss (pos_weight 동적 계산: (1-long_ratio)/long_ratio)
   옵티마이저: AdamW (lr=3e-4, wd=1e-4) + clip_grad_norm(1.0)
   스케줄러  : CosineAnnealingLR (T_max = n_epochs)
-  EarlyStopping: Val GMADLoss 기준, patience=15
+  EarlyStopping: Val BCE Loss 기준, patience=15
   저장 경로 : artifacts/dl_prod/cryptomamba_model.pt
+
+변경 이력
+──────────────────────────────────────────────────────────────────────────────
+  v2 (2026-03-13)
+    - TARGET_COL: future_ret_1 → future_ret_15 (노이즈 감소, 추세 신호 강화)
+    - EXCLUDE_COLS에 future_ret_5/15/60 추가 (Data Leakage 원천 차단)
+    - future_ret_15 없으면 close.pct_change(15).shift(-15) 즉석 계산
+    - 타겟을 이진(0/1)으로 변환 후 분할 (SettingWithCopyWarning 제거)
+    - 손실함수: GMADLoss → BCEWithLogitsLoss (pos_weight 동적 설정)
+    - evaluate(): 시그모이드 임계값 기반 방향 정확도로 교체
 
 실행 방법
 ──────────────────────────────────────────────────────────────────────────────
@@ -53,7 +64,6 @@ _PROJ = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJ))
 
 from app.predictor.dl_model import CryptoMambaClassifier   # noqa: E402
-from app.predictor.losses import GMADLoss                  # noqa: E402
 
 # ── 경로 상수 ─────────────────────────────────────────────────────────────
 DATASET_PATH  = _PROJ / "data" / "datasets" / "btc_1m_hft_v2.parquet"
@@ -67,8 +77,14 @@ FEAT_COLS_PATH = ARTIFACT_DIR / "cryptomamba_feature_cols.json"
 TRAIN_LOG_PATH = ARTIFACT_DIR / "cryptomamba_train_log.json"
 
 # ── 데이터 상수 ───────────────────────────────────────────────────────────
-TARGET_COL   = "future_ret_1"                        # 연속형 회귀 타겟
-EXCLUDE_COLS = {"target", "future_ret", "target_1m", "future_ret_1"}
+# [수정 1] 타겟 변수: future_ret_1 → future_ret_15
+TARGET_COL   = "future_ret_15"
+
+# [수정 1] 미래 수익률 컬럼 전체 제외 (Data Leakage 원천 차단)
+EXCLUDE_COLS = {
+    "target", "future_ret", "target_1m",
+    "future_ret_1", "future_ret_5", "future_ret_15", "future_ret_60",
+}
 
 SEQ_LEN     = 60     # 슬라이딩 윈도우 길이 (1시간 = 60분봉)
 TRAIN_RATIO = 0.70
@@ -82,12 +98,11 @@ VAL_RATIO   = 0.15
 class HFTTimeSeriesDataset(Dataset):
     """v2 데이터셋용 슬라이딩 윈도우 시계열 Dataset.
 
-    기존 CryptoTimeSeriesDataset과 동일 구조이나
-    연속형 타겟(future_ret_1)을 반환.
+    이진 분류 타겟(future_ret_15 > 0)을 반환.
 
     Args:
         X      : (T, F) 정규화된 피처 배열
-        y      : (T,)  연속형 타겟 (future_ret_1)
+        y      : (T,)  이진 타겟 (0 or 1)
         seq_len: 윈도우 크기 (default 60)
         stride : 윈도우 간격 (default 1)
     """
@@ -110,7 +125,7 @@ class HFTTimeSeriesDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         start = self._indices[idx]
         x_win = self.X[start : start + self.seq_len]    # (seq_len, F)
-        y_lbl = self.y[start + self.seq_len]             # scalar
+        y_lbl = self.y[start + self.seq_len]             # scalar (0 or 1)
         return x_win, y_lbl
 
 
@@ -128,15 +143,25 @@ def build_loaders(
 
     Returns:
         (train_loader, val_loader, test_loader, meta)
-        meta keys: n_features, tau, feature_cols, split_sizes, pos_ratios
+        meta keys: n_features, feature_cols, split_sizes, long_ratio
     """
     print(f"[Data] 로드: {parquet_path.name}")
     df = pd.read_parquet(parquet_path)
 
-    # target NaN 제거 (마지막 1행)
+    # [수정 2] future_ret_15가 없으면 즉석 계산 (close 기준 15분 수익률)
+    if TARGET_COL not in df.columns:
+        print(f"  [Info] '{TARGET_COL}' 컬럼 없음 → close 기준 즉석 계산")
+        if "close" not in df.columns:
+            raise ValueError("parquet에 'close' 컬럼이 없어 future_ret_15를 계산할 수 없습니다.")
+        df[TARGET_COL] = df["close"].pct_change(15).shift(-15)
+
+    # target NaN 제거 (마지막 15행 + 앞쪽 결측)
     df = df.dropna(subset=[TARGET_COL])
 
-    # 피처 컬럼 결정
+    # [수정 2] 이진 분류 타겟으로 변환 (분할 전 일괄 처리 → SettingWithCopyWarning 제거)
+    df[TARGET_COL] = (df[TARGET_COL] > 0).astype(np.float32)
+
+    # 피처 컬럼 결정 (미래 수익률 컬럼 전체 제외)
     feat_cols: list[str] = [c for c in df.columns if c not in EXCLUDE_COLS]
     df[feat_cols] = df[feat_cols].ffill().bfill()
 
@@ -154,7 +179,7 @@ def build_loaders(
     test_df  = df.iloc[n_tr + n_vl:]
 
     print(f"  Train : {len(train_df):,}행  |  Val : {len(val_df):,}행  |  Test : {len(test_df):,}행")
-    print(f"  피처 수: {len(feat_cols)}  |  타겟: {TARGET_COL}")
+    print(f"  피처 수: {len(feat_cols)}  |  타겟: {TARGET_COL} (이진 분류)")
 
     # ── Scaler (Train only) ─────────────────────────────────────────────
     scaler = RobustScaler()
@@ -163,10 +188,6 @@ def build_loaders(
 
     with open(FEAT_COLS_PATH, "w") as f:
         json.dump(feat_cols, f, indent=2)
-
-    # ── tau 동적 계산 (future_ret_1 std on train) ─────────────────────
-    tau = float(train_df[TARGET_COL].std())
-    print(f"  tau (future_ret_1 std) = {tau:.6f}")
 
     def to_arrays(split: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         X = scaler.transform(split[feat_cols].values).astype(np.float32)
@@ -187,22 +208,24 @@ def build_loaders(
     val_loader   = DataLoader(val_ds,   batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    # ── 방향 비율 (양수 return = LONG 방향) ─────────────────────────────
+    # [수정 3] LONG 비율 계산 (윈도우 뒤 샘플 기준) → pos_weight 계산에 사용
     def pos_ratio(y_arr: np.ndarray) -> float:
-        return float((y_arr[seq_len:] > 0).mean())
+        return float(y_arr[seq_len:].mean())
 
-    print(f"  LONG 방향 비율  Train={pos_ratio(y_tr):.3f}  "
+    long_ratio_tr = pos_ratio(y_tr)
+    print(f"  LONG 비율  Train={long_ratio_tr:.3f}  "
           f"Val={pos_ratio(y_vl):.3f}  Test={pos_ratio(y_te):.3f}")
 
     meta = {
-        "n_features":   len(feat_cols),
-        "tau":          tau,
-        "feature_cols": feat_cols,
-        "seq_len":      seq_len,
-        "batch_size":   batch_size,
+        "n_features":    len(feat_cols),
+        "feature_cols":  feat_cols,
+        "seq_len":       seq_len,
+        "batch_size":    batch_size,
         "train_samples": len(train_ds),
         "val_samples":   len(val_ds),
         "test_samples":  len(test_ds),
+        # [수정 3] pos_weight 계산용 LONG 비율
+        "long_ratio":    long_ratio_tr,
     }
     return train_loader, val_loader, test_loader, meta
 
@@ -212,7 +235,7 @@ def build_loaders(
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EarlyStopping:
-    """Val GMADLoss 기준 조기 종료.
+    """Val BCE Loss 기준 조기 종료.
 
     Args:
         patience  : 개선 없이 허용할 최대 에폭 수
@@ -249,49 +272,39 @@ class EarlyStopping:
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
-    criterion: GMADLoss,
+    criterion: nn.Module,
     device: torch.device,
-    min_magnitude: float = 1e-5,
 ) -> dict[str, float]:
-    """평가 루프 — GMADLoss, 방향 정확도, MSE 계산.
+    """평가 루프 — BCE Loss, 이진 분류 정확도 계산.
 
     Args:
-        min_magnitude: 방향 정확도 계산 시 타겟 절대값 최소 임계값
-                       (0 근방 노이즈 제외)
+        criterion: BCEWithLogitsLoss 인스턴스
     """
     model.eval()
-    total_gmadl, total_mse, total_samples = 0.0, 0.0, 0
-    n_correct, n_valid = 0, 0
+    total_bce, total_samples = 0.0, 0
+    n_correct = 0
 
     for x_batch, y_batch in loader:
         x_batch = x_batch.to(device, non_blocking=True)
         y_batch = y_batch.to(device, non_blocking=True)
 
-        pred = model(x_batch).squeeze(-1)   # (B,)
-        y    = y_batch                       # (B,)
-        B    = len(y)
+        logit = model(x_batch).squeeze(-1)   # (B,) — raw logit
+        B = len(y_batch)
 
-        # GMADLoss
-        total_gmadl += criterion(pred, y).item() * B
+        # BCE Loss
+        total_bce += criterion(logit, y_batch).item() * B
 
-        # MSE
-        total_mse += torch.mean((pred - y) ** 2).item() * B
-
-        # 방향 정확도 (|target| ≥ min_magnitude인 샘플만)
-        mask = y.abs() >= min_magnitude
-        if mask.sum() > 0:
-            correct = (torch.sign(pred[mask]) == torch.sign(y[mask])).sum().item()
-            n_correct += correct
-            n_valid   += int(mask.sum())
+        # 이진 정확도: sigmoid(logit) > 0.5 → 1 (LONG 예측)
+        pred_label = (torch.sigmoid(logit) > 0.5).float()
+        n_correct  += (pred_label == y_batch).sum().item()
 
         total_samples += B
 
-    dir_acc = n_correct / n_valid if n_valid > 0 else float("nan")
+    dir_acc = n_correct / total_samples if total_samples > 0 else float("nan")
     return {
-        "gmadl":    total_gmadl  / total_samples,
-        "mse":      total_mse    / total_samples,
+        "bce":      total_bce   / total_samples,
         "dir_acc":  dir_acc,
-        "n_valid":  n_valid,
+        "n_valid":  total_samples,
     }
 
 
@@ -309,8 +322,6 @@ def train(
     n_high:      int   = 1,
     d_conv:      int   = 4,
     dropout:     float = 0.10,
-    gamma:       float = 500.0,
-    alpha:       float = 0.70,
     max_grad_norm: float = 1.0,
     patience:    int   = 15,
     smoke_test:  bool  = False,
@@ -318,7 +329,7 @@ def train(
     num_workers: int   = 0,
     project_root: Path | None = None,
 ) -> dict:
-    """전체 학습 파이프라인 실행."""
+    """전체 학습 파이프라인 실행 (이진 분류 버전)."""
 
     global _PROJ, DATASET_PATH, MODEL_PATH, META_PATH
     if project_root is not None:
@@ -327,7 +338,7 @@ def train(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'═'*62}")
-    print(f"  Step DL-9: CryptoMamba 학습 시작")
+    print(f"  Step DL-9: CryptoMamba 학습 시작  [타겟: {TARGET_COL}]")
     print(f"{'═'*62}")
     print(f"  디바이스  : {device}")
     print(f"  배치 크기 : {batch_size}  |  에폭 : {n_epochs}  |  patience : {patience}")
@@ -343,11 +354,11 @@ def train(
         batch_size=batch_size,
         num_workers=num_workers,
         max_rows=max_rows,
-        train_stride=2 if not smoke_test else 4,  # stride로 학습 속도 조절
+        train_stride=2 if not smoke_test else 4,
     )
 
     n_features = meta["n_features"]
-    tau        = meta["tau"]
+    long_ratio  = meta["long_ratio"]
 
     # ── 모델 ───────────────────────────────────────────────────────────
     model = CryptoMambaClassifier(
@@ -362,9 +373,13 @@ def train(
     total_params = model.count_params()
     print(f"\n  모델 파라미터: {total_params:,}")
 
-    # ── 손실 함수 (tau 동적 설정) ──────────────────────────────────────
-    criterion = GMADLoss(tau=tau, gamma=gamma, alpha=alpha, normalize_w=True)
-    print(f"  GMADLoss tau={tau:.6f}  gamma={gamma}  alpha={alpha}")
+    # [수정 3] 동적 pos_weight 계산: (1 - LONG비율) / LONG비율
+    # LONG이 적을수록 pos_weight > 1 → LONG 클래스에 더 큰 패널티
+    pos_weight_val = (1.0 - long_ratio) / max(long_ratio, 1e-6)
+    pos_weight_tensor = torch.tensor([pos_weight_val], dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    print(f"  BCEWithLogitsLoss  pos_weight={pos_weight_val:.4f}  "
+          f"(LONG비율={long_ratio:.3f})")
 
     # ── 옵티마이저 + 스케줄러 ──────────────────────────────────────────
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -381,9 +396,9 @@ def train(
     best_state: dict | None = None
     t_start = time.time()
 
-    print(f"\n  {'에폭':>5s}  {'Train GMADL':>12s}  {'Val GMADL':>10s}  "
-          f"{'Val DirAcc':>10s}  {'Val MSE':>10s}  {'LR':>10s}  {'시간(s)':>8s}")
-    print(f"  {'─'*80}")
+    print(f"\n  {'에폭':>5s}  {'Train BCE':>12s}  {'Val BCE':>10s}  "
+          f"{'Val DirAcc':>10s}  {'LR':>10s}  {'시간(s)':>8s}")
+    print(f"  {'─'*70}")
 
     for epoch in range(1, n_ep_run + 1):
         t_ep = time.time()
@@ -396,18 +411,17 @@ def train(
             y_batch = y_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            pred = model(x_batch).squeeze(-1)           # (B,)
-            loss = criterion(pred, y_batch)
+            logit = model(x_batch).squeeze(-1)           # (B,) raw logit
+            loss  = criterion(logit, y_batch)
             loss.backward()
 
-            # ── Gradient Clipping (GMADL 극단적 그래디언트 방지) ─────
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
             optimizer.step()
             ep_loss   += loss.item()
             n_batches += 1
 
-        train_gmadl = ep_loss / n_batches
+        train_bce = ep_loss / n_batches
 
         # ── Validation ────────────────────────────────────────────────
         val_metrics = evaluate(model, val_loader, criterion, device)
@@ -416,17 +430,16 @@ def train(
         if scheduler_type == "cosine":
             scheduler.step()
         else:
-            scheduler.step(val_metrics["gmadl"])
+            scheduler.step(val_metrics["bce"])
 
         current_lr = optimizer.param_groups[0]["lr"]
         ep_time    = time.time() - t_ep
 
         row = {
             "epoch":       epoch,
-            "train_gmadl": train_gmadl,
-            "val_gmadl":   val_metrics["gmadl"],
+            "train_bce":   train_bce,
+            "val_bce":     val_metrics["bce"],
             "val_dir_acc": val_metrics["dir_acc"],
-            "val_mse":     val_metrics["mse"],
             "lr":          current_lr,
         }
         history.append(row)
@@ -435,12 +448,12 @@ def train(
         if early_stop.best_epoch == epoch - 1 or epoch == 1:
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
-        print(f"  {epoch:>5d}  {train_gmadl:>12.6f}  {val_metrics['gmadl']:>10.6f}  "
-              f"{val_metrics['dir_acc']:>10.4f}  {val_metrics['mse']:>10.2e}  "
+        print(f"  {epoch:>5d}  {train_bce:>12.6f}  {val_metrics['bce']:>10.6f}  "
+              f"{val_metrics['dir_acc']*100:>9.2f}%  "
               f"{current_lr:>10.2e}  {ep_time:>8.1f}")
 
         # ── EarlyStopping ─────────────────────────────────────────────
-        stopped = early_stop(val_metrics["gmadl"], epoch)
+        stopped = early_stop(val_metrics["bce"], epoch)
         if stopped:
             print(f"\n  조기 종료: {early_stop.patience}에폭 개선 없음 (best at epoch {early_stop.best_epoch})")
             break
@@ -460,10 +473,9 @@ def train(
     print("  최종 Test 평가 (best 모델)")
     print(f"{'─'*62}")
     test_metrics = evaluate(model, test_loader, criterion, device)
-    print(f"  Test GMADL      : {test_metrics['gmadl']:.6f}")
+    print(f"  Test BCE Loss   : {test_metrics['bce']:.6f}")
     print(f"  Test 방향 정확도: {test_metrics['dir_acc']*100:.2f}%  "
-          f"(유효 샘플 {test_metrics['n_valid']:,}개)")
-    print(f"  Test MSE        : {test_metrics['mse']:.2e}")
+          f"(전체 {test_metrics['n_valid']:,}샘플)")
 
     # ── 학습 로그 저장 ─────────────────────────────────────────────────
     log = {
@@ -473,21 +485,22 @@ def train(
         },
         "train_config": {
             "lr": lr, "weight_decay": weight_decay, "batch_size": batch_size,
-            "n_epochs_run": len(history), "tau": tau, "gamma": gamma, "alpha": alpha,
-            "max_grad_norm": max_grad_norm, "patience": patience,
+            "n_epochs_run": len(history), "long_ratio": long_ratio,
+            "pos_weight": pos_weight_val, "max_grad_norm": max_grad_norm,
+            "patience": patience, "target_col": TARGET_COL,
         },
-        "best_epoch":   early_stop.best_epoch,
-        "best_val_gmadl": early_stop.best,
-        "test_metrics": test_metrics,
-        "elapsed_sec":  elapsed,
-        "history":      history,
+        "best_epoch":     early_stop.best_epoch,
+        "best_val_bce":   early_stop.best,
+        "test_metrics":   test_metrics,
+        "elapsed_sec":    elapsed,
+        "history":        history,
     }
     with open(TRAIN_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)
     print(f"\n  학습 로그 저장: {TRAIN_LOG_PATH.name}")
 
-    # ── 방향 정확도 분포 분석 ──────────────────────────────────────────
-    _print_direction_analysis(model, test_loader, device)
+    # ── 예측 분포 분석 ──────────────────────────────────────────────────
+    _print_prediction_analysis(model, test_loader, device)
 
     print(f"\n{'═'*62}")
     print("  Step DL-9 완료")
@@ -496,53 +509,54 @@ def train(
     return log
 
 
-def _print_direction_analysis(
+def _print_prediction_analysis(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
 ) -> None:
-    """예측값 vs 실제값 방향 분석 — magnitude 구간별 정확도."""
+    """예측 확률 분포 및 신뢰도 구간별 정확도 분석."""
     model.eval()
-    all_pred, all_true = [], []
+    all_prob, all_true = [], []
 
     with torch.no_grad():
         for x_batch, y_batch in loader:
-            pred = model(x_batch.to(device)).squeeze(-1).cpu()
-            all_pred.append(pred)
+            logit = model(x_batch.to(device)).squeeze(-1)
+            prob  = torch.sigmoid(logit).cpu()
+            all_prob.append(prob)
             all_true.append(y_batch)
 
-    pred_arr = torch.cat(all_pred).numpy()
+    prob_arr = torch.cat(all_prob).numpy()
     true_arr = torch.cat(all_true).numpy()
 
     print(f"\n{'─'*62}")
-    print("  magnitude 구간별 방향 정확도 (Test)")
+    print("  신뢰도 구간별 정확도 (Test, 이진 분류)")
     print(f"{'─'*62}")
-    print(f"  {'구간':>20s}  {'샘플 수':>10s}  {'방향 정확도':>12s}")
-    print(f"  {'─'*48}")
+    print(f"  {'구간':>25s}  {'샘플 수':>10s}  {'정확도':>10s}")
+    print(f"  {'─'*50}")
 
-    thresholds = [
-        ("전체 샘플",       0.0,    np.inf),
-        ("|ret| > 0.01%",  1e-4,   np.inf),
-        ("|ret| > 0.05%",  5e-4,   np.inf),
-        ("|ret| > 0.1%",   1e-3,   np.inf),
-        ("|ret| > 0.2%",   2e-3,   np.inf),
-        ("|ret| 0.01-0.1%", 1e-4,  1e-3),
-        ("|ret| > 0.1%",    1e-3,   np.inf),
+    bands = [
+        ("전체",                        0.00, 1.00),
+        ("LONG 고확신  (prob > 0.60)",   0.60, 1.00),
+        ("LONG 중확신  (0.55 < p ≤ 0.60)", 0.55, 0.60),
+        ("SHORT 고확신 (prob < 0.40)",   0.00, 0.40),
+        ("SHORT 중확신 (0.40 ≤ p < 0.45)", 0.40, 0.45),
+        ("불확실 구간  (0.45 ≤ p ≤ 0.55)", 0.45, 0.55),
     ]
 
-    for label, lo, hi in thresholds:
-        mask = (np.abs(true_arr) >= lo) & (np.abs(true_arr) < hi)
+    for label, lo, hi in bands:
+        mask = (prob_arr >= lo) & (prob_arr < hi)
         n = mask.sum()
         if n == 0:
             continue
-        acc = (np.sign(pred_arr[mask]) == np.sign(true_arr[mask])).mean()
-        print(f"  {label:>20s}  {n:>10,}  {acc*100:>11.2f}%")
+        pred_bin = (prob_arr[mask] > 0.5).astype(float)
+        acc = (pred_bin == true_arr[mask]).mean()
+        print(f"  {label:>25s}  {n:>10,}  {acc*100:>9.2f}%")
 
-    # 예측 분포
-    print(f"\n  예측값(pred) 분포:")
-    print(f"    mean={pred_arr.mean():.6f}  std={pred_arr.std():.6f}")
-    print(f"    min={pred_arr.min():.6f}  max={pred_arr.max():.6f}")
-    print(f"    pred > 0 비율 (LONG 신호): {(pred_arr > 0).mean()*100:.1f}%")
+    print(f"\n  예측 확률(sigmoid) 분포:")
+    print(f"    mean={prob_arr.mean():.4f}  std={prob_arr.std():.4f}")
+    print(f"    min={prob_arr.min():.4f}  max={prob_arr.max():.4f}")
+    print(f"    LONG 예측 비율 (prob > 0.5): {(prob_arr > 0.5).mean()*100:.1f}%")
+    print(f"    실제 LONG 비율             : {true_arr.mean()*100:.1f}%")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -550,7 +564,7 @@ def _print_direction_analysis(
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Step DL-9: CryptoMamba 학습")
+    parser = argparse.ArgumentParser(description="Step DL-9: CryptoMamba 학습 (15분 이진 분류)")
 
     # 데이터
     parser.add_argument("--project_root", type=Path, default=None,
@@ -570,12 +584,6 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay",type=float, default=1e-4)
     parser.add_argument("--patience",    type=int,   default=15)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-
-    # 손실 함수
-    parser.add_argument("--gamma", type=float, default=500.0,
-                        help="GMADLoss 지수 평활화 계수")
-    parser.add_argument("--alpha", type=float, default=0.70,
-                        help="GMADLoss 방향성 비율")
 
     # 스케줄러
     parser.add_argument("--scheduler", type=str, default="cosine",
@@ -599,8 +607,6 @@ if __name__ == "__main__":
         n_high=args.n_high,
         d_conv=args.d_conv,
         dropout=args.dropout,
-        gamma=args.gamma,
-        alpha=args.alpha,
         max_grad_norm=args.max_grad_norm,
         patience=args.patience,
         smoke_test=args.smoke_test,
