@@ -1,21 +1,14 @@
 """
-Step DL-3: LSTM 모델 학습 스크립트
+Step DL-3: LSTM 모델 학습 스크립트 (GPU 최적화 & 체크포인트 재개 기능 추가)
 
 실행:
-    poetry run python scripts/dl/step_dl_3_train.py
-
-주요 설정:
-    - hidden_size=64, num_layers=2, dropout=0.2
-    - Loss: BCEWithLogitsLoss + pos_weight (클래스 불균형 보정)
-    - Optimizer: AdamW (lr=1e-3, weight_decay=1e-4)
-    - Scheduler: ReduceLROnPlateau (patience=3, factor=0.5)
-    - Early Stopping: patience=10 (Val Loss 기준)
-    - Max Epochs: 50
+    !PYTHONPATH=. python scripts/dl/step_dl_3_train.py
 """
 
 import sys
 import time
 from pathlib import Path
+import os # 추가
 
 import numpy as np
 import torch
@@ -43,16 +36,18 @@ from app.predictor.dl_model import ARTIFACT_DIR, MODEL_META_PATH, MODEL_PATH, LS
 # ── 하이퍼파라미터 ─────────────────────────────────────────────────────────
 HIDDEN_SIZE = 64
 NUM_LAYERS = 2
-DROPOUT = 0.35         # 강화된 드롭아웃
+DROPOUT = 0.35
 LR = 3e-4
 WEIGHT_DECAY = 1e-3
 MAX_EPOCHS = 50
 ES_PATIENCE = 10
 LR_PATIENCE = 4
 LR_FACTOR = 0.5
-DEVICE = "cpu"
 TRAIN_STRIDE = 3
-POS_WEIGHT_CAP = 1.5   # FINAL: val AUC 최고 설정 (Run2)
+POS_WEIGHT_CAP = 1.5
+
+# ⭐ 수정 포인트 1: 디바이스 자동 설정 (GPU가 있으면 cuda, 없으면 cpu)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ── 유틸리티 ──────────────────────────────────────────────────────────────
@@ -68,8 +63,10 @@ def compute_pos_weight(y_train: np.ndarray) -> torch.Tensor:
     n_long = y_train.sum()
     n_flat = len(y_train) - n_long
     pw_raw = n_flat / max(n_long, 1)
-    pw = min(pw_raw, POS_WEIGHT_CAP)   # 과도한 LONG 편향 방지
+    pw = min(pw_raw, POS_WEIGHT_CAP)
     print(f"  pos_weight: {pw:.4f}  (raw={pw_raw:.4f}, FLAT {int(n_flat):,} / LONG {int(n_long):,})")
+    
+    # ⭐ 수정 포인트 2: pos_weight 텐서도 GPU로 생성
     return torch.tensor([pw], dtype=torch.float32, device=DEVICE)
 
 
@@ -84,11 +81,12 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     for x_batch, y_batch in loader:
+        # ⭐ 수정 포인트 3: 데이터를 GPU 메모리로 이동
         x_batch = x_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE).unsqueeze(1)   # (B,) → (B,1)
+        y_batch = y_batch.to(DEVICE).unsqueeze(1)
 
         optimizer.zero_grad()
-        logit = model(x_batch)                       # (B,1)
+        logit = model(x_batch)
         loss = criterion(logit, y_batch)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -110,8 +108,10 @@ def evaluate(
     all_labels: list[np.ndarray] = []
 
     for x_batch, y_batch in loader:
+        # ⭐ 수정 포인트 4: 평가 데이터도 GPU 메모리로 이동
         x_batch = x_batch.to(DEVICE)
         y_batch = y_batch.to(DEVICE).unsqueeze(1)
+        
         logit = model(x_batch)
         loss = criterion(logit, y_batch)
         total_loss += loss.item()
@@ -147,7 +147,8 @@ def evaluate(
 # ── 메인 학습 루프 ─────────────────────────────────────────────────────────
 
 def main() -> None:
-    sep("Step DL-3: LSTM 모델 설계 및 학습")
+    sep("Step DL-3: LSTM 모델 설계 및 학습 (GPU 버전)")
+    print(f"  사용 디바이스: {DEVICE}") # GPU가 정상적으로 잡히는지 출력
     t_start = time.time()
 
     # ── 1. DataLoader 로드 ────────────────────────────────────────────────
@@ -156,7 +157,7 @@ def main() -> None:
         parquet_path=DATASET_PATH,
         seq_len=SEQ_LEN,
         batch_size=BATCH_SIZE,
-        save_artifacts=False,   # Step 2에서 이미 저장됨
+        save_artifacts=False,
         train_stride=TRAIN_STRIDE,
     )
     print(f"  Train stride: {TRAIN_STRIDE} (매 {TRAIN_STRIDE}분 1샘플 → CPU 학습 최적화)")
@@ -167,25 +168,32 @@ def main() -> None:
     print(f"  Test  샘플: {meta['test_samples']:,}")
     print(f"  Train LONG 비율: {meta['train_pos_ratio']:.3f}")
 
-    # ── 2. 모델 초기화 ────────────────────────────────────────────────────
-    sep("2. 모델 초기화")
-    model = LSTMClassifier(
-        n_features=n_features,
-        hidden_size=HIDDEN_SIZE,
-        num_layers=NUM_LAYERS,
-        dropout=DROPOUT,
-    ).to(DEVICE)
+    # ── 2. 모델 초기화 (또는 로드) ────────────────────────────────────────────────────
+    sep("2. 모델 초기화 및 체크포인트 확인")
+    
+    # ⭐ 수정 포인트 5: 기존 학습된 모델 파일(.pt)이 있다면 불러와서 이어서 학습
+    if os.path.exists(MODEL_PATH) and os.path.exists(MODEL_META_PATH):
+        print(f"  기존 모델 체크포인트 발견! 이어서 학습을 준비합니다: {MODEL_PATH}")
+        model = LSTMClassifier.load(MODEL_PATH, MODEL_META_PATH, device=DEVICE)
+    else:
+        print("  새로운 모델을 초기화합니다.")
+        model = LSTMClassifier(
+            n_features=n_features,
+            hidden_size=HIDDEN_SIZE,
+            num_layers=NUM_LAYERS,
+            dropout=DROPOUT,
+        ).to(DEVICE)
+        
     print(f"  파라미터 수: {model.count_params():,}")
-    print(f"  모델 구조:\n{model}")
 
     # ── 3. 손실함수 / 옵티마이저 / 스케줄러 ──────────────────────────────
     sep("3. 훈련 설정")
 
-    # pos_weight: Train 레이블로 동적 계산 (Data Leakage 없음)
     y_train_all = np.array([y.numpy() for _, y in train_loader.dataset])
     pw = compute_pos_weight(y_train_all)
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
+    # ⭐ 수정 포인트 6: loss 함수를 GPU로 할당
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pw).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=LR_PATIENCE, factor=LR_FACTOR
@@ -266,7 +274,7 @@ def main() -> None:
     # 혼동 행렬
     sep("6. 혼동 행렬 (Test)")
     cm = confusion_matrix(test_metrics["labels"], test_metrics["preds"])
-    print(f"  실제\\예측     FLAT(0)  LONG(1)")
+    print(f"  실제\\예측    FLAT(0)  LONG(1)")
     print(f"  FLAT(0):    {cm[0,0]:7,}  {cm[0,1]:7,}")
     print(f"  LONG(1):    {cm[1,0]:7,}  {cm[1,1]:7,}")
     tn, fp, fn, tp = cm.ravel()
