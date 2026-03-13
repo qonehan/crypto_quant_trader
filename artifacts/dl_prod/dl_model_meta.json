@@ -1,0 +1,5 @@
+{
+  "n_features": 52,
+  "hidden_size": 64,
+  "num_layers": 2
+}
