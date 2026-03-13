@@ -44,13 +44,25 @@ ES_PATIENCE = 10
 LR_PATIENCE = 4
 LR_FACTOR = 0.5
 TRAIN_STRIDE = 3
-POS_WEIGHT_CAP = 1.5
+POS_WEIGHT_CAP = 1.25
 
 # ⭐ 수정 포인트 1: 디바이스 자동 설정 (GPU가 있으면 cuda, 없으면 cpu)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ── 유틸리티 ──────────────────────────────────────────────────────────────
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1.0, gamma=2.0, pos_weight=None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.bce_with_logits = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='none')
+
+    def forward(self, inputs, targets):
+        bce_loss = self.bce_with_logits(inputs, targets)
+        pt = torch.exp(-bce_loss) # 오답일수록 pt가 0에 가까워짐
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
 
 def sep(title: str) -> None:
     print(f"\n{'='*65}")
@@ -123,7 +135,8 @@ def evaluate(
 
     probs_all = np.concatenate(all_logits)
     labels_all = np.concatenate(all_labels)
-    preds_all = (probs_all >= 0.5).astype(int)
+    THRESHOLD = 0.55 
+    preds_all = (probs_all >= THRESHOLD).astype(int)
 
     auc_roc = roc_auc_score(labels_all, probs_all)
     f1 = f1_score(labels_all, preds_all, zero_division=0)
@@ -194,7 +207,7 @@ def main() -> None:
     pw = compute_pos_weight(y_train_all)
 
     # ⭐ 수정 포인트 6: loss 함수를 GPU로 할당
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pw).to(DEVICE)
+    criterion = FocalLoss(alpha=1.0, gamma=2.0, pos_weight=pw).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=LR_PATIENCE, factor=LR_FACTOR
