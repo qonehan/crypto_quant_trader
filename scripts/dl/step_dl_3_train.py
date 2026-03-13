@@ -175,6 +175,7 @@ def main() -> None:
     if os.path.exists(MODEL_PATH) and os.path.exists(MODEL_META_PATH):
         print(f"  기존 모델 체크포인트 발견! 이어서 학습을 준비합니다: {MODEL_PATH}")
         model = LSTMClassifier.load(MODEL_PATH, MODEL_META_PATH, device=DEVICE)
+        model = model.to(DEVICE) 
     else:
         print("  새로운 모델을 초기화합니다.")
         model = LSTMClassifier(
@@ -261,6 +262,7 @@ def main() -> None:
     # ── 5. 최종 Test 평가 ─────────────────────────────────────────────────
     sep("5. Test 평가 (Best Model 로드)")
     best_model = LSTMClassifier.load(MODEL_PATH, MODEL_META_PATH, device=DEVICE)
+    best_model = best_model.to(DEVICE)
     test_metrics = evaluate(best_model, test_loader, criterion)
 
     print(f"  Best Epoch   : {best_epoch}")
