@@ -1,50 +1,56 @@
 """
-Step DL-9: CryptoMambaClassifier GPU 학습 스크립트  [v3 — 15분 타겟 이진 분류]
+Step DL-9: CryptoMamba 학습 스크립트  [v4 — 15분 타겟 GMADLoss 회귀]
 
 개요
 ──────────────────────────────────────────────────────────────────────────────
   이 스크립트는 1분봉 60개(1시간 시퀀스)를 입력받아
-  15분 뒤의 가격 추세 방향(LONG / SHORT·FLAT)을 이진 분류하는 모델을 학습합니다.
+  15분 뒤의 로그수익률(future_ret_15)을 GMADLoss 회귀로 학습합니다.
+  방향(부호)과 변동성 크기(Magnitude)를 동시에 훈련시켜
+  단순 이진 분류 대비 더 풍부한 알파 신호를 포착합니다.
 
 학습 설정
 ──────────────────────────────────────────────────────────────────────────────
   데이터셋   : btc_1m_hft_v2.parquet  (67+피처 + future_ret_15 타겟)
-  예측 타겟  : future_ret_15 — 15분 뒤 종가 기준 로그수익률
-  라벨 변환  : future_ret_15 > 0 → 1 (LONG), ≤ 0 → 0 (SHORT/FLAT)
-               ※ 분할 후 각 split 독립 처리 (Data Leakage 완전 차단)
+  예측 타겟  : future_ret_15 — 실수 로그수익률 (회귀, 이진화 없음)
   모델       : CryptoMambaClassifier  (DWT + Selective SSM + KAN Mixer)
-  손실함수   : BCEWithLogitsLoss  (pos_weight = n_neg / max(n_pos, 1), 동적 계산)
+  손실함수   : GMADLoss (tau=std(train_ret15), gamma, alpha — 방향+Magnitude)
   옵티마이저 : AdamW (lr=3e-4, wd=1e-4) + clip_grad_norm(1.0)
   스케줄러   : CosineAnnealingLR (T_max = n_epochs)
-  EarlyStopping: Val BCE Loss 기준, patience=15
-  평가 지표  : Confusion Matrix / Precision / Recall / F1 / Balanced Accuracy
+  EarlyStopping: Val GMADLoss 최소화 기준, patience=15
+  평가 지표  : GMADLoss / MSE / DirAcc (|ret|≥0.01% 필터)
   저장 경로  : artifacts/dl_prod/cryptomamba_model.pt
 
 변경 이력
 ──────────────────────────────────────────────────────────────────────────────
+  v4 (2026-03-14)
+    - 타겟 복구: 이진 분류(> 0) → raw float 회귀 (future_ret_15 실수값 직접 사용)
+    - 손실함수 교체: BCEWithLogitsLoss → GMADLoss (방향+Magnitude 동시 최적화)
+    - tau 동적 계산: train_df[TARGET_COL].std() → meta["tau"] → GMADLoss(tau=tau)
+    - 평가 지표 전면 개편: BCE/F1/BalAcc → gmadl/mse/dir_acc(노이즈 필터)
+    - best_state 기준: Val BCE → Val GMADLoss
+    - 에폭 출력: [Train GMADL | Val GMADL | Val MSE | Val DirAcc] 형태
+    - pos_weight, n_pos/n_neg, long_ratio 관련 로직 전체 제거
+    - CLI args 추가: --gamma (default 100), --alpha (default 0.70)
+
   v3 (2026-03-14)
-    - 타임프레임 피벗 완료: 전체 타겟을 future_ret_15로 일원화
-    - future_ret_15 즉석 계산 코드 제거 (데이터셋에 컬럼 확정 포함)
-    - 평가 지표 전면 교체: BCE+Acc → Confusion Matrix + Precision/Recall/F1/BalAcc
-    - best_state 직접 추적 (best_metric 변수) → 저장 순서 버그 수정
-    - pos_weight = n_neg/max(n_pos,1) 동적 계산 (하드코딩 제거)
-    - Data Leakage 원천 차단: 분할 후 ffill→train_median fill (bfill 제거)
-    - LayerNorm(1) 상수화 버그 수정, dt_proj.bias=2.0 복구 (dl_model.py)
+    - 이진 분류 버전 (BCE + Confusion Matrix + F1 + BalAcc)
 
   v2 (2026-03-13)
-    - TARGET_COL: future_ret_1 → future_ret_15 (노이즈 감소, 추세 신호 강화)
-    - 손실함수: GMADLoss → BCEWithLogitsLoss
+    - TARGET_COL: future_ret_1 → future_ret_15
 
 실행 방법
 ──────────────────────────────────────────────────────────────────────────────
   # 로컬 (CPU)
   poetry run python scripts/dl/step_dl_9_train_mamba.py
 
-  # Colab (GPU) — 데이터 업로드 후
+  # Colab (GPU)
   !python scripts/dl/step_dl_9_train_mamba.py --batch_size 1024 --epochs 100
 
-  # 빠른 스모크 테스트 (로직 검증용, 3 epochs, 15K행)
+  # 스모크 테스트 (로직 검증, 3에폭, 15K행)
   poetry run python scripts/dl/step_dl_9_train_mamba.py --smoke_test
+
+  # GMADLoss 하이퍼파라미터 커스텀
+  poetry run python scripts/dl/step_dl_9_train_mamba.py --gamma 150 --alpha 0.75
 ──────────────────────────────────────────────────────────────────────────────
 Colab 환경 설정 (필요 시):
   !pip install pyarrow joblib -q
@@ -76,7 +82,8 @@ from torch.utils.data import DataLoader, Dataset
 _PROJ = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJ))
 
-from app.predictor.dl_model import CryptoMambaClassifier   # noqa: E402
+from app.predictor.dl_model  import CryptoMambaClassifier   # noqa: E402
+from app.predictor.losses    import GMADLoss                 # noqa: E402
 
 # ── 경로 상수 ─────────────────────────────────────────────────────────────
 DATASET_PATH  = _PROJ / "data" / "datasets" / "btc_1m_hft_v2.parquet"
@@ -90,7 +97,7 @@ FEAT_COLS_PATH = ARTIFACT_DIR / "cryptomamba_feature_cols.json"
 TRAIN_LOG_PATH = ARTIFACT_DIR / "cryptomamba_train_log.json"
 
 # ── 데이터 상수 ───────────────────────────────────────────────────────────
-# 예측 타겟: 15분 뒤 로그수익률 방향 (future_ret_15 > 0 → LONG)
+# 예측 타겟: 15분 뒤 수익률 실수값 (회귀 — 이진화 없음)
 TARGET_COL   = "future_ret_15"
 
 # 미래 수익률 컬럼 전체 제외 — Data Leakage 원천 차단
@@ -109,13 +116,13 @@ VAL_RATIO   = 0.15
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HFTTimeSeriesDataset(Dataset):
-    """1분봉 60개 슬라이딩 윈도우 → 15분 추세 방향 이진 라벨 반환.
+    """1분봉 60개 슬라이딩 윈도우 → 15분 수익률 실수값 반환 (회귀 타겟).
 
-    타겟: future_ret_15 > 0 → 1 (LONG), ≤ 0 → 0 (SHORT/FLAT)
+    타겟: future_ret_15 실수값 (이진화 없음 — GMADLoss 회귀용)
 
     Args:
         X      : (T, F) 정규화된 피처 배열
-        y      : (T,)  이진 타겟 (0 or 1)
+        y      : (T,)  실수 타겟 (future_ret_15 원본값)
         seq_len: 윈도우 크기 (default 60)
         stride : 윈도우 간격 (default 1)
     """
@@ -138,8 +145,8 @@ class HFTTimeSeriesDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         start = self._indices[idx]
         x_win = self.X[start : start + self.seq_len]    # (seq_len, F)
-        y_lbl = self.y[start + self.seq_len]             # scalar (0 or 1)
-        return x_win, y_lbl
+        y_val = self.y[start + self.seq_len]             # scalar — 실수 수익률
+        return x_win, y_val
 
 
 def build_loaders(
@@ -154,25 +161,25 @@ def build_loaders(
 ) -> tuple[DataLoader, DataLoader, DataLoader, dict]:
     """btc_1m_hft_v2.parquet → Train/Val/Test DataLoader + 메타 딕셔너리.
 
-    15분 타겟(future_ret_15) 이진 분류용 파이프라인:
+    15분 타겟(future_ret_15) GMADLoss 회귀용 파이프라인:
       1. 시간순 분할 (누수 방지)
       2. ffill → train_median fillna (bfill 금지)
-      3. Raw target > 0 기준 이진 라벨링 (각 split 독립)
+      3. 타겟은 raw float 그대로 사용 (이진화 없음)
       4. RobustScaler: Train only fit
+      5. tau = train std(future_ret_15) → GMADLoss 커널 스케일
 
     Returns:
         (train_loader, val_loader, test_loader, meta)
-        meta keys: n_features, feature_cols, split_sizes,
-                   long_ratio, n_pos, n_neg
+        meta keys: n_features, feature_cols, split_sizes, tau
     """
-    print(f"[Data] 15분 타겟 분류 데이터 로드: {parquet_path.name}")
+    print(f"[Data] 15분 타겟 회귀 데이터 로드: {parquet_path.name}")
     df = pd.read_parquet(parquet_path)
 
     # future_ret_15는 데이터셋에 확정 포함됨 — 컬럼 부재 시 즉시 에러
     if TARGET_COL not in df.columns:
         raise KeyError(
             f"'{TARGET_COL}' 컬럼이 데이터셋에 없습니다. "
-            f"데이터 파이프라인(step_dl_*_collect.py)을 통해 {TARGET_COL}이 "
+            f"step_dl_6_feature_engineering.py를 실행하여 {TARGET_COL}이 "
             f"포함된 parquet을 생성한 뒤 재실행하세요."
         )
 
@@ -196,7 +203,7 @@ def build_loaders(
     test_df  = df.iloc[n_tr + n_vl:].copy()
 
     print(f"  분할 완료 → Train:{len(train_df):,}  Val:{len(val_df):,}  Test:{len(test_df):,}행")
-    print(f"  피처 수: {len(feat_cols)}  |  예측 타겟: {TARGET_COL} (15분 이진 분류)")
+    print(f"  피처 수: {len(feat_cols)}  |  예측 타겟: {TARGET_COL} (15분 회귀)")
 
     # 결측치 처리: ffill 먼저(시간 연속성 유지), 나머지는 Train median으로 채움
     # bfill은 미래 정보를 역방향으로 끌어오므로 사용 금지
@@ -209,11 +216,15 @@ def build_loaders(
     val_df[feat_cols]   = val_df[feat_cols].fillna(train_median)
     test_df[feat_cols]  = test_df[feat_cols].fillna(train_median)
 
-    # Raw target 기준 이진 분류 라벨링: 원본 future_ret_15 값 > 0 여부로 각 split 독립 처리
-    # (Z-score 정규화 후 판단 방식 불사용 → 라벨 의미 보존)
-    y_tr = (train_df[TARGET_COL].values > 0).astype(np.float32)
-    y_vl = (val_df[TARGET_COL].values > 0).astype(np.float32)
-    y_te = (test_df[TARGET_COL].values > 0).astype(np.float32)
+    # 타겟: raw float 그대로 사용 (회귀 — 이진화 없음)
+    y_tr = train_df[TARGET_COL].values.astype(np.float32)
+    y_vl = val_df[TARGET_COL].values.astype(np.float32)
+    y_te = test_df[TARGET_COL].values.astype(np.float32)
+
+    # tau 계산: Train 타겟의 std → GMADLoss 커널 스케일 (누수 없음)
+    tau = float(np.std(y_tr[seq_len:]))   # DataLoader가 사용하는 샘플 기준
+    print(f"  15분 수익률 통계  Train: mean={y_tr.mean():+.6f}  std={y_tr.std():.6f}  "
+          f"tau(GMADLoss)={tau:.6f}")
 
     # ── Scaler: Train only fit → Val/Test에 동일 변환 적용 (누수 없음) ──
     scaler = RobustScaler()
@@ -236,19 +247,6 @@ def build_loaders(
     val_loader   = DataLoader(val_ds,   batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    # pos_weight 계산용: DataLoader가 실제 사용하는 샘플(seq_len 이후) 기준 n_pos/n_neg
-    valid_y_tr = y_tr[seq_len:]
-    n_pos = int(valid_y_tr.sum())
-    n_neg = int(len(valid_y_tr) - n_pos)
-
-    def pos_ratio(y_arr: np.ndarray) -> float:
-        return float(y_arr[seq_len:].mean()) if len(y_arr) > seq_len else float(y_arr.mean())
-
-    long_ratio_tr = pos_ratio(y_tr)
-    print(f"  15분 LONG 비율  Train={long_ratio_tr:.3f} "
-          f" Val={pos_ratio(y_vl):.3f}  Test={pos_ratio(y_te):.3f}")
-    print(f"  Train 15분 LONG={n_pos:,}  SHORT/FLAT={n_neg:,}")
-
     meta = {
         "n_features":    len(feat_cols),
         "feature_cols":  feat_cols,
@@ -257,10 +255,7 @@ def build_loaders(
         "train_samples": len(train_ds),
         "val_samples":   len(val_ds),
         "test_samples":  len(test_ds),
-        "long_ratio":    long_ratio_tr,
-        # [Fix 5] 실제 학습 타겟 기준 pos/neg 샘플 수
-        "n_pos":         n_pos,
-        "n_neg":         n_neg,
+        "tau":           tau,   # GMADLoss 커널 스케일
     }
     return train_loader, val_loader, test_loader, meta
 
@@ -270,7 +265,7 @@ def build_loaders(
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EarlyStopping:
-    """Val BCE Loss 기준 조기 종료.
+    """Val GMADLoss 기준 조기 종료.
 
     Args:
         patience  : 개선 없이 허용할 최대 에폭 수
@@ -307,24 +302,26 @@ class EarlyStopping:
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
-    criterion: nn.Module,
+    criterion: GMADLoss,
     device: torch.device,
+    min_magnitude: float = 1e-4,
 ) -> dict[str, float]:
-    """[Fix 7] 평가 루프 — 분류 문제 맞춤형 지표 계산.
+    """평가 루프 — 회귀 맞춤형 지표 계산.
 
-    이진 분류에 특화된 지표를 계산합니다:
-      - BCE Loss
-      - Confusion Matrix (TP/TN/FP/FN)
-      - Precision, Recall, F1 Score
-      - Balanced Accuracy: 클래스 불균형 상태에서 모델 지능을 정확히 파악
-        = (Sensitivity + Specificity) / 2
-        = 클래스별 recall의 평균 (단순 accuracy와 달리 불균형에 강인)
+    반환 지표:
+      - gmadl    : 평균 GMADLoss (방향+Magnitude 통합 손실)
+      - mse      : 평균 제곱 오차 (예측값의 절대적 정확도)
+      - dir_acc  : 방향 정확도 — |y_true| ≥ min_magnitude 인 샘플만 평가
+                   (노이즈 필터: 0.01% 미만 미세 변동 제외)
+      - n_valid  : 전체 샘플 수
+      - n_filtered: 방향 정확도 계산에 사용된 샘플 수 (magnitude 필터 후)
 
     Args:
-        criterion: BCEWithLogitsLoss 인스턴스
+        criterion    : GMADLoss 인스턴스
+        min_magnitude: 방향 정확도 계산 시 최소 변동폭 임계값 (default 1e-4 = 0.01%)
     """
     model.eval()
-    total_bce = 0.0
+    total_gmadl = 0.0
     all_pred: list[torch.Tensor] = []
     all_true: list[torch.Tensor] = []
 
@@ -332,40 +329,32 @@ def evaluate(
         x_batch = x_batch.to(device, non_blocking=True)
         y_batch = y_batch.to(device, non_blocking=True)
 
-        logit = model(x_batch).squeeze(-1)          # (B,) — raw logit
-        total_bce += criterion(logit, y_batch).item() * len(y_batch)
-
-        pred_label = (torch.sigmoid(logit) > 0.5).float()
-        all_pred.append(pred_label.cpu())
+        pred = model(x_batch).squeeze(-1)          # (B,) — 예측 수익률 (raw)
+        total_gmadl += criterion(pred, y_batch).item() * len(y_batch)
+        all_pred.append(pred.cpu())
         all_true.append(y_batch.cpu())
 
     pred_arr = torch.cat(all_pred).numpy()
     true_arr = torch.cat(all_true).numpy()
     total_samples = len(true_arr)
 
-    # ── Confusion Matrix ──────────────────────────────────────────────
-    tp = int(((pred_arr == 1) & (true_arr == 1)).sum())
-    tn = int(((pred_arr == 0) & (true_arr == 0)).sum())
-    fp = int(((pred_arr == 1) & (true_arr == 0)).sum())
-    fn = int(((pred_arr == 0) & (true_arr == 1)).sum())
+    # MSE
+    mse = float(((pred_arr - true_arr) ** 2).mean())
 
-    # ── 분류 지표 ─────────────────────────────────────────────────────
-    precision    = tp / max(tp + fp, 1)
-    recall       = tp / max(tp + fn, 1)          # = Sensitivity
-    f1           = 2 * precision * recall / max(precision + recall, 1e-8)
-    specificity  = tn / max(tn + fp, 1)
-    balanced_acc = (recall + specificity) / 2    # 클래스 불균형에 강인한 지표
-    dir_acc      = (tp + tn) / max(total_samples, 1)
+    # 방향 정확도: |y_true| ≥ min_magnitude 샘플에 대해 부호 일치 비율
+    mag_mask = np.abs(true_arr) >= min_magnitude
+    n_filtered = int(mag_mask.sum())
+    if n_filtered > 0:
+        dir_acc = float((np.sign(pred_arr[mag_mask]) == np.sign(true_arr[mag_mask])).mean())
+    else:
+        dir_acc = float("nan")
 
     return {
-        "bce":          total_bce / max(total_samples, 1),
-        "precision":    precision,
-        "recall":       recall,
-        "f1":           f1,
-        "balanced_acc": balanced_acc,
-        "dir_acc":      dir_acc,
-        "n_valid":      total_samples,
-        "confusion":    {"tp": tp, "tn": tn, "fp": fp, "fn": fn},
+        "gmadl":      total_gmadl / max(total_samples, 1),
+        "mse":        mse,
+        "dir_acc":    dir_acc,
+        "n_valid":    total_samples,
+        "n_filtered": n_filtered,
     }
 
 
@@ -374,23 +363,25 @@ def evaluate(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train(
-    n_epochs:    int   = 100,
-    batch_size:  int   = 512,
-    lr:          float = 3e-4,
-    weight_decay:float = 1e-4,
-    d_model:     int   = 64,
-    n_low:       int   = 2,
-    n_high:      int   = 1,
-    d_conv:      int   = 4,
-    dropout:     float = 0.10,
-    max_grad_norm: float = 1.0,
-    patience:    int   = 15,
-    smoke_test:  bool  = False,
+    n_epochs:     int   = 100,
+    batch_size:   int   = 512,
+    lr:           float = 3e-4,
+    weight_decay: float = 1e-4,
+    d_model:      int   = 64,
+    n_low:        int   = 2,
+    n_high:       int   = 1,
+    d_conv:       int   = 4,
+    dropout:      float = 0.10,
+    max_grad_norm:float = 1.0,
+    patience:     int   = 15,
+    gamma:        float = 100.0,
+    alpha:        float = 0.70,
+    smoke_test:   bool  = False,
     scheduler_type: str = "cosine",
-    num_workers: int   = 0,
+    num_workers:  int   = 0,
     project_root: Path | None = None,
 ) -> dict:
-    """15분 추세 이진 분류 — 전체 학습 파이프라인 실행."""
+    """15분 수익률 GMADLoss 회귀 — 전체 학습 파이프라인 실행."""
 
     global _PROJ, DATASET_PATH, MODEL_PATH, META_PATH
     if project_root is not None:
@@ -399,11 +390,12 @@ def train(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'═'*62}")
-    print(f"  Step DL-9: CryptoMamba  15분 방향 분류 학습")
-    print(f"  타겟: {TARGET_COL} > 0 → LONG(1) / ≤ 0 → SHORT·FLAT(0)")
+    print(f"  Step DL-9: CryptoMamba  15분 수익률 GMADLoss 회귀 학습")
+    print(f"  타겟: {TARGET_COL}  (raw float, 이진화 없음)")
     print(f"{'═'*62}")
     print(f"  디바이스  : {device}")
     print(f"  배치 크기 : {batch_size}  |  에폭 : {n_epochs}  |  patience : {patience}")
+    print(f"  GMADLoss  : gamma={gamma}  alpha={alpha}")
     if smoke_test:
         print("  [MODE] 스모크 테스트 — 3 에폭, 15K행")
 
@@ -420,7 +412,7 @@ def train(
     )
 
     n_features = meta["n_features"]
-    long_ratio  = meta["long_ratio"]
+    tau        = meta["tau"]
 
     # ── 모델 ───────────────────────────────────────────────────────────
     model = CryptoMambaClassifier(
@@ -435,14 +427,11 @@ def train(
     total_params = model.count_params()
     print(f"\n  모델 파라미터: {total_params:,}")
 
-    # pos_weight 동적 계산: Train의 실제 15분 LONG/SHORT 비율 기반 (n_neg / n_pos)
-    n_pos = meta["n_pos"]
-    n_neg = meta["n_neg"]
-    pos_weight_val = n_neg / max(n_pos, 1)
-    pos_weight_tensor = torch.tensor([pos_weight_val], dtype=torch.float32, device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    print(f"  BCEWithLogitsLoss  pos_weight={pos_weight_val:.4f}  "
-          f"(15분 LONG={n_pos:,}  SHORT/FLAT={n_neg:,}  비율={long_ratio:.3f})")
+    # ── 손실함수: GMADLoss ─────────────────────────────────────────────
+    # tau = train std(future_ret_15): tanh 커널 스케일 — 15분 변동성 기준 자동 설정
+    criterion = GMADLoss(tau=tau, gamma=gamma, alpha=alpha, normalize_w=True)
+    criterion = criterion.to(device)
+    print(f"  GMADLoss  tau={tau:.6f}  gamma={gamma}  alpha={alpha}  normalize_w=True")
 
     # ── 옵티마이저 + 스케줄러 ──────────────────────────────────────────
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -457,13 +446,12 @@ def train(
     # ── 학습 루프 ──────────────────────────────────────────────────────
     history: list[dict] = []
     best_state: dict | None = None
-    # [Fix 6] early_stop.best_epoch 의존 방식 폐기 → 직접 best_metric 추적
-    best_metric = float("inf")
+    best_metric = float("inf")   # Val GMADLoss 직접 추적
     t_start = time.time()
 
-    print(f"\n  {'에폭':>5s}  {'Train BCE':>12s}  {'Val BCE':>10s}  "
-          f"{'Val F1':>8s}  {'BalAcc':>8s}  {'LR':>10s}  {'시간(s)':>7s}")
-    print(f"  {'─'*75}")
+    print(f"\n  {'에폭':>5s}  {'Train GMADL':>13s}  {'Val GMADL':>11s}  "
+          f"{'Val MSE':>11s}  {'DirAcc':>8s}  {'LR':>10s}  {'시간(s)':>7s}")
+    print(f"  {'─'*80}")
 
     for epoch in range(1, n_ep_run + 1):
         t_ep = time.time()
@@ -476,56 +464,56 @@ def train(
             y_batch = y_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            logit = model(x_batch).squeeze(-1)           # (B,) raw logit
-            loss  = criterion(logit, y_batch)
+            pred = model(x_batch).squeeze(-1)    # (B,) — 예측 수익률
+            loss = criterion(pred, y_batch)
             loss.backward()
 
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-
             optimizer.step()
+
             ep_loss   += loss.item()
             n_batches += 1
 
-        train_bce = ep_loss / n_batches
+        train_gmadl = ep_loss / n_batches
 
         # ── Validation ────────────────────────────────────────────────
         val_metrics = evaluate(model, val_loader, criterion, device)
 
-        # [Fix 6] 평가 수치가 갱신될 때만 best_state 저장
-        # early_stop 호출 전에 직접 best_metric을 비교하여 올바른 에폭의 가중치 보존
-        if val_metrics["bce"] < best_metric:
-            best_metric = val_metrics["bce"]
+        # Val GMADLoss 최소화 기준으로 best_state 저장
+        if val_metrics["gmadl"] < best_metric:
+            best_metric = val_metrics["gmadl"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         # ── LR 스케줄러 업데이트 ──────────────────────────────────────
         if scheduler_type == "cosine":
             scheduler.step()
         else:
-            scheduler.step(val_metrics["bce"])
+            scheduler.step(val_metrics["gmadl"])
 
         current_lr = optimizer.param_groups[0]["lr"]
         ep_time    = time.time() - t_ep
 
+        dir_str = f"{val_metrics['dir_acc']*100:.2f}%" if not np.isnan(val_metrics["dir_acc"]) else "  nan  "
+
         row = {
-            "epoch":         epoch,
-            "train_bce":     train_bce,
-            "val_bce":       val_metrics["bce"],
-            "val_f1":        val_metrics["f1"],
-            "val_balanced_acc": val_metrics["balanced_acc"],
-            "val_precision": val_metrics["precision"],
-            "val_recall":    val_metrics["recall"],
-            "lr":            current_lr,
+            "epoch":       epoch,
+            "train_gmadl": train_gmadl,
+            "val_gmadl":   val_metrics["gmadl"],
+            "val_mse":     val_metrics["mse"],
+            "val_dir_acc": val_metrics["dir_acc"],
+            "lr":          current_lr,
         }
         history.append(row)
 
-        print(f"  {epoch:>5d}  {train_bce:>12.6f}  {val_metrics['bce']:>10.6f}  "
-              f"{val_metrics['f1']:>8.4f}  {val_metrics['balanced_acc']:>8.4f}  "
+        print(f"  {epoch:>5d}  {train_gmadl:>13.6f}  {val_metrics['gmadl']:>11.6f}  "
+              f"{val_metrics['mse']:>11.8f}  {dir_str:>8s}  "
               f"{current_lr:>10.2e}  {ep_time:>7.1f}")
 
-        # ── EarlyStopping ─────────────────────────────────────────────
-        stopped = early_stop(val_metrics["bce"], epoch)
+        # ── EarlyStopping (Val GMADLoss 기준) ─────────────────────────
+        stopped = early_stop(val_metrics["gmadl"], epoch)
         if stopped:
-            print(f"\n  조기 종료: {early_stop.patience}에폭 개선 없음 (best at epoch {early_stop.best_epoch})")
+            print(f"\n  조기 종료: {early_stop.patience}에폭 개선 없음 "
+                  f"(best at epoch {early_stop.best_epoch}, gmadl={early_stop.best:.6f})")
             break
 
     elapsed = time.time() - t_start
@@ -540,17 +528,16 @@ def train(
 
     # ── Test 평가 ──────────────────────────────────────────────────────
     print(f"\n{'─'*62}")
-    print("  최종 Test 평가 (best 모델) — 분류 지표")
+    print("  최종 Test 평가 (best 모델) — 회귀 지표")
     print(f"{'─'*62}")
     test_metrics = evaluate(model, test_loader, criterion, device)
-    cm = test_metrics["confusion"]
-    print(f"  Test BCE Loss    : {test_metrics['bce']:.6f}")
-    print(f"  Precision        : {test_metrics['precision']*100:.2f}%")
-    print(f"  Recall           : {test_metrics['recall']*100:.2f}%")
-    print(f"  F1 Score         : {test_metrics['f1']:.4f}")
-    print(f"  Balanced Accuracy: {test_metrics['balanced_acc']*100:.2f}%  ← 불균형 강인 지표")
-    print(f"  일반 정확도      : {test_metrics['dir_acc']*100:.2f}%  (전체 {test_metrics['n_valid']:,}샘플)")
-    print(f"  Confusion Matrix → TP={cm['tp']:,}  TN={cm['tn']:,}  FP={cm['fp']:,}  FN={cm['fn']:,}")
+    print(f"  Test GMADLoss : {test_metrics['gmadl']:.6f}")
+    print(f"  Test MSE      : {test_metrics['mse']:.8f}  "
+          f"(RMSE={test_metrics['mse']**0.5:.6f})")
+    dir_pct = test_metrics["dir_acc"] * 100 if not np.isnan(test_metrics["dir_acc"]) else float("nan")
+    print(f"  방향 정확도   : {dir_pct:.2f}%  "
+          f"(|ret|≥0.01% 필터 후 {test_metrics['n_filtered']:,}샘플 / "
+          f"전체 {test_metrics['n_valid']:,}샘플)")
 
     # ── 학습 로그 저장 ─────────────────────────────────────────────────
     log = {
@@ -560,23 +547,23 @@ def train(
         },
         "train_config": {
             "lr": lr, "weight_decay": weight_decay, "batch_size": batch_size,
-            "n_epochs_run": len(history), "long_ratio": long_ratio,
-            "pos_weight": pos_weight_val, "n_pos": n_pos, "n_neg": n_neg,
+            "n_epochs_run": len(history), "tau": tau,
+            "gamma": gamma, "alpha": alpha,
             "max_grad_norm": max_grad_norm, "patience": patience,
             "target_col": TARGET_COL,
         },
-        "best_epoch":     early_stop.best_epoch,
-        "best_val_bce":   early_stop.best,
-        "test_metrics":   test_metrics,
-        "elapsed_sec":    elapsed,
-        "history":        history,
+        "best_epoch":      early_stop.best_epoch,
+        "best_val_gmadl":  early_stop.best,
+        "test_metrics":    test_metrics,
+        "elapsed_sec":     elapsed,
+        "history":         history,
     }
     with open(TRAIN_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)
     print(f"\n  학습 로그 저장: {TRAIN_LOG_PATH.name}")
 
-    # ── 분류 상세 분석 ──────────────────────────────────────────────────
-    _print_classification_analysis(model, test_loader, device)
+    # ── 회귀 상세 분석 ──────────────────────────────────────────────────
+    _print_regression_analysis(model, test_loader, criterion, device)
 
     print(f"\n{'═'*62}")
     print("  Step DL-9 완료")
@@ -585,96 +572,88 @@ def train(
     return log
 
 
-def _print_classification_analysis(
+def _print_regression_analysis(
     model: nn.Module,
     loader: DataLoader,
+    criterion: GMADLoss,
     device: torch.device,
 ) -> None:
-    """[Fix 7] 분류 문제 맞춤형 상세 분석.
+    """회귀 예측 결과 상세 분석.
 
     출력:
-      - Confusion Matrix (전체 + 신뢰도 구간별)
-      - Precision / Recall / F1 / Balanced Accuracy
-      - 예측 확률(sigmoid) 분포
+      - 예측값 분포 (mean, std, min, max)
+      - magnitude 구간별 방향 정확도
+      - 실제 vs 예측 부호 일치 분포
     """
     model.eval()
-    all_prob: list[torch.Tensor] = []
+    all_pred: list[torch.Tensor] = []
     all_true: list[torch.Tensor] = []
 
     with torch.no_grad():
         for x_batch, y_batch in loader:
-            logit = model(x_batch.to(device)).squeeze(-1)
-            prob  = torch.sigmoid(logit).cpu()
-            all_prob.append(prob)
+            pred = model(x_batch.to(device)).squeeze(-1)
+            all_pred.append(pred.cpu())
             all_true.append(y_batch)
 
-    prob_arr = torch.cat(all_prob).numpy()
+    pred_arr = torch.cat(all_pred).numpy()
     true_arr = torch.cat(all_true).numpy()
-    pred_arr = (prob_arr > 0.5).astype(float)
-
-    # ── 전체 분류 지표 ────────────────────────────────────────────────
-    tp = int(((pred_arr == 1) & (true_arr == 1)).sum())
-    tn = int(((pred_arr == 0) & (true_arr == 0)).sum())
-    fp = int(((pred_arr == 1) & (true_arr == 0)).sum())
-    fn = int(((pred_arr == 0) & (true_arr == 1)).sum())
-
-    precision    = tp / max(tp + fp, 1)
-    recall       = tp / max(tp + fn, 1)
-    f1           = 2 * precision * recall / max(precision + recall, 1e-8)
-    specificity  = tn / max(tn + fp, 1)
-    balanced_acc = (recall + specificity) / 2
 
     print(f"\n{'─'*62}")
-    print("  [Fix 7] 분류 상세 분석 (Test, 이진 분류)")
+    print("  회귀 예측 상세 분석 (Test)")
     print(f"{'─'*62}")
-    print(f"  Confusion Matrix:")
-    print(f"    TP(LONG→LONG)   = {tp:>8,}    FN(LONG→SHORT) = {fn:>8,}")
-    print(f"    FP(SHORT→LONG)  = {fp:>8,}    TN(SHORT→SHORT)= {tn:>8,}")
-    print(f"\n  분류 지표:")
-    print(f"    Precision        : {precision*100:.2f}%  (예측 LONG 중 실제 LONG 비율)")
-    print(f"    Recall(Sensitivity): {recall*100:.2f}%  (실제 LONG 중 맞힌 비율)")
-    print(f"    Specificity      : {specificity*100:.2f}%  (실제 SHORT 중 맞힌 비율)")
-    print(f"    F1 Score         : {f1:.4f}")
-    print(f"    Balanced Accuracy: {balanced_acc*100:.2f}%  ← 클래스 불균형 강인 지표")
-    print(f"    일반 정확도      : {(tp+tn)/len(true_arr)*100:.2f}%")
 
-    # ── 신뢰도 구간별 정밀 분석 ──────────────────────────────────────
-    print(f"\n{'─'*62}")
-    print("  신뢰도 구간별 Precision / Recall")
-    print(f"{'─'*62}")
-    print(f"  {'구간':>28s}  {'샘플':>7s}  {'Prec':>7s}  {'Rec':>7s}  {'F1':>7s}")
-    print(f"  {'─'*58}")
+    # ── 예측값 / 실제값 분포 ──────────────────────────────────────────
+    print(f"  예측값 분포:")
+    print(f"    mean={pred_arr.mean():+.6f}  std={pred_arr.std():.6f}  "
+          f"min={pred_arr.min():+.6f}  max={pred_arr.max():+.6f}")
+    print(f"  실제값 분포:")
+    print(f"    mean={true_arr.mean():+.6f}  std={true_arr.std():.6f}  "
+          f"min={true_arr.min():+.6f}  max={true_arr.max():+.6f}")
 
-    bands = [
-        ("전체                      ", 0.00, 1.00),
-        ("LONG 고확신  (prob > 0.65) ", 0.65, 1.00),
-        ("LONG 중확신  (0.55~0.65)   ", 0.55, 0.65),
-        ("불확실 구간  (0.45~0.55)   ", 0.45, 0.55),
-        ("SHORT 중확신 (0.35~0.45)   ", 0.35, 0.45),
-        ("SHORT 고확신 (prob < 0.35) ", 0.00, 0.35),
+    # ── magnitude 구간별 방향 정확도 ──────────────────────────────────
+    print(f"\n  magnitude 구간별 방향 정확도 (실제 |ret| 기준)")
+    print(f"  {'구간':>30s}  {'샘플':>8s}  {'방향 정확도':>12s}")
+    print(f"  {'─'*55}")
+
+    thresholds = [
+        ("전체 (필터 없음)             ", 0.0),
+        ("|ret| ≥ 0.01%  (1e-4)       ", 1e-4),
+        ("|ret| ≥ 0.05%  (5e-4)       ", 5e-4),
+        ("|ret| ≥ 0.10%  (1e-3)       ", 1e-3),
+        ("|ret| ≥ 0.20%  (2e-3)       ", 2e-3),
+        ("|ret| ≥ 0.50%  (5e-3)       ", 5e-3),
     ]
 
-    for label, lo, hi in bands:
-        mask = (prob_arr >= lo) & (prob_arr < hi)
+    for label, thr in thresholds:
+        mask = np.abs(true_arr) >= thr
         n = int(mask.sum())
         if n == 0:
             continue
-        p_bin = (prob_arr[mask] > 0.5).astype(float)
-        t_bin = true_arr[mask]
-        b_tp = int(((p_bin == 1) & (t_bin == 1)).sum())
-        b_fp = int(((p_bin == 1) & (t_bin == 0)).sum())
-        b_fn = int(((p_bin == 0) & (t_bin == 1)).sum())
-        b_prec = b_tp / max(b_tp + b_fp, 1)
-        b_rec  = b_tp / max(b_tp + b_fn, 1)
-        b_f1   = 2 * b_prec * b_rec / max(b_prec + b_rec, 1e-8)
-        print(f"  {label}  {n:>7,}  {b_prec*100:>6.1f}%  {b_rec*100:>6.1f}%  {b_f1:>7.4f}")
+        acc = float((np.sign(pred_arr[mask]) == np.sign(true_arr[mask])).mean())
+        print(f"  {label}  {n:>8,}  {acc*100:>11.2f}%")
 
-    # ── 예측 확률 분포 ────────────────────────────────────────────────
-    print(f"\n  예측 확률(sigmoid) 분포:")
-    print(f"    mean={prob_arr.mean():.4f}  std={prob_arr.std():.4f}")
-    print(f"    min={prob_arr.min():.4f}  max={prob_arr.max():.4f}")
-    print(f"    LONG 예측 비율 (prob > 0.5): {(prob_arr > 0.5).mean()*100:.1f}%")
-    print(f"    실제 LONG 비율             : {true_arr.mean()*100:.1f}%")
+    # ── 예측 방향 분포 ────────────────────────────────────────────────
+    pred_long  = (pred_arr > 0).mean()
+    true_long  = (true_arr > 0).mean()
+    print(f"\n  방향 예측 분포:")
+    print(f"    LONG 예측 비율 (pred > 0): {pred_long*100:.1f}%")
+    print(f"    실제 LONG 비율 (ret  > 0): {true_long*100:.1f}%")
+
+    # ── 4분위 방향 정확도 ─────────────────────────────────────────────
+    print(f"\n  실제 수익률 4분위별 방향 정확도:")
+    q25, q50, q75 = np.percentile(true_arr, [25, 50, 75])
+    quartiles = [
+        (f"Q1 (ret < {q25:+.4f})          ", true_arr < q25),
+        (f"Q2 ({q25:+.4f} ≤ ret < {q50:+.4f})", (true_arr >= q25) & (true_arr < q50)),
+        (f"Q3 ({q50:+.4f} ≤ ret < {q75:+.4f})", (true_arr >= q50) & (true_arr < q75)),
+        (f"Q4 (ret ≥ {q75:+.4f})          ", true_arr >= q75),
+    ]
+    for label, mask in quartiles:
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        acc = float((np.sign(pred_arr[mask]) == np.sign(true_arr[mask])).mean())
+        print(f"  {label}  {n:>8,}  {acc*100:>11.2f}%")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -683,7 +662,7 @@ def _print_classification_analysis(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Step DL-9: CryptoMambaClassifier 학습 — 1분봉 60개로 15분 뒤 추세 방향 이진 분류"
+        description="Step DL-9: CryptoMamba 학습 — 1분봉 60개로 15분 수익률 GMADLoss 회귀"
     )
 
     # 데이터
@@ -698,12 +677,18 @@ if __name__ == "__main__":
     parser.add_argument("--dropout",  type=float, default=0.10)
 
     # 학습 하이퍼파라미터
-    parser.add_argument("--epochs",      type=int,   default=100)
-    parser.add_argument("--batch_size",  type=int,   default=512)
-    parser.add_argument("--lr",          type=float, default=3e-4)
-    parser.add_argument("--weight_decay",type=float, default=1e-4)
-    parser.add_argument("--patience",    type=int,   default=15)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--epochs",       type=int,   default=100)
+    parser.add_argument("--batch_size",   type=int,   default=512)
+    parser.add_argument("--lr",           type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--patience",     type=int,   default=15)
+    parser.add_argument("--max_grad_norm",type=float, default=1.0)
+
+    # GMADLoss 하이퍼파라미터
+    parser.add_argument("--gamma", type=float, default=100.0,
+                        help="GMADLoss exp 평활화 계수 (15분 기준 기본값=100)")
+    parser.add_argument("--alpha", type=float, default=0.70,
+                        help="GMADLoss 방향 손실 비율 (0~1, 기본값=0.70)")
 
     # 스케줄러
     parser.add_argument("--scheduler", type=str, default="cosine",
@@ -729,6 +714,8 @@ if __name__ == "__main__":
         dropout=args.dropout,
         max_grad_norm=args.max_grad_norm,
         patience=args.patience,
+        gamma=args.gamma,
+        alpha=args.alpha,
         smoke_test=args.smoke_test,
         scheduler_type=args.scheduler,
         num_workers=args.num_workers,
