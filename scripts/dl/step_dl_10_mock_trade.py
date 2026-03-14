@@ -34,6 +34,7 @@ Step DL-10: CryptoMamba 모의투자 백테스트
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 import time
@@ -146,8 +147,17 @@ def run_inference(
                preds[i]는 X_test[i + SEQ_LEN]에 해당하는 타임스텝의 예측값
     """
     print("[Inference] 모델 로드 및 배치 추론 시작...")
+
+    # ── 모델 로드 후 .to(device) 명시 ──────────────────────────────────────
+    # load() 내부에서 cls(**meta)는 CPU에 생성되고 load_state_dict()만 호출되므로
+    # map_location 만으로는 model.parameters()가 GPU로 이동하지 않음.
+    # .to(device) 를 추가로 호출해야 모든 파라미터·버퍼가 타겟 장비로 이동한다.
     model = CryptoMambaClassifier.load(MODEL_PATH, META_PATH, device=str(device))
+    model.to(device)   # ← 핵심: 모든 서브모듈·버퍼 강제 GPU 이동
     model.eval()
+
+    # CUDA AMP 사용 가능 여부 판단 (CPU 환경에서는 비활성화)
+    use_amp = device.type == "cuda"
 
     n_windows = len(X_test) - SEQ_LEN
     preds: list[float] = []
@@ -158,8 +168,13 @@ def run_inference(
             end = min(start + batch_size, n_windows)
             # (batch, SEQ_LEN, n_features) 배치 구성
             batch = np.stack([X_test[i : i + SEQ_LEN] for i in range(start, end)])
-            x_tensor = torch.tensor(batch, dtype=torch.float32).to(device)
-            p = model(x_tensor).squeeze(-1).cpu().numpy()
+            # torch.from_numpy: 복사 없이 메모리 공유 → .to(device) 로 GPU 전송
+            x_tensor = torch.from_numpy(batch).to(device)
+
+            # AMP autocast: GPU에서 FP16 연산 → 속도↑ · 메모리↓ (CPU는 no-op)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                p = model(x_tensor).squeeze(-1).cpu().numpy()
+
             preds.extend(p.tolist())
 
             if (start // batch_size) % 50 == 0:
@@ -283,6 +298,10 @@ def main(
 
     # ── 2. 배치 추론 ────────────────────────────────────────────────────
     preds = run_inference(X_test, device, batch_size=batch_size)
+
+    # X_test는 추론 완료 후 불필요 — RAM/VRAM 즉시 해제
+    del X_test
+    gc.collect()
 
     # ── 3. 예측 결과 DataFrame 구성 ─────────────────────────────────────
     # preds[i]는 test_df.iloc[SEQ_LEN + i]에 해당
