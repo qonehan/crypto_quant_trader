@@ -1,19 +1,20 @@
 """
 app/predictor/dl_model.py
 
-PyTorch 시계열 모델 모음 (KRW-BTC 1분봉)
+PyTorch 시계열 모델 모음 (KRW-BTC 1분봉, 15분 타겟 이진 분류)
 
 Models:
     LSTMClassifier        — 1D-CNN + Stacked LSTM             (Step DL-3)
     TCNClassifier         — Temporal Convolutional Network     (Step DL-5)
-    CryptoMambaClassifier — DWT + Selective SSM + KAN Mixer   (Step DL-8)
+    CryptoMambaClassifier — DWT + Selective SSM + KAN Mixer   (Step DL-8/9)
 
 CryptoMamba 아키텍처 개요:
     [HaarDWT1D]  → low (B, T//2, F) + high (B, T//2, F)
     [InputProj]  → F → d_model 투영
     [MambaBlock × N] → 선택적 SSM (Selectivity: 입력 의존 망각률)
     [KANLayer × 2]   → EfficientKAN 근사 (선형 + SiLU 기저)
-    Output: (B, 1) — 1분 로그수익률 예측 / GMADLoss 회귀 타겟
+    Output: (B, 1) — 15분 로그수익률 방향 예측 (이진 분류 logit)
+                      future_ret_15 > 0 → 1 (LONG), ≤ 0 → 0 (SHORT/FLAT)
 """
 
 from __future__ import annotations
@@ -445,7 +446,8 @@ class _KANLayer(nn.Module):
         super().__init__()
         self.w_base   = nn.Linear(in_features, out_features)       # 선형 기저
         self.w_spline = nn.Linear(in_features, out_features, bias=False)  # 비선형 기저
-        self.norm     = nn.LayerNorm(out_features)
+        # [Fix 1] out_features==1이면 LayerNorm(1)이 결과를 무조건 0으로 만드는 버그 방지
+        self.norm     = nn.Identity() if out_features == 1 else nn.LayerNorm(out_features)
         self.drop     = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -460,8 +462,8 @@ class CryptoMambaClassifier(nn.Module):
     """DWT + Selective SSM (Mamba-proxy) + KAN Mixer 하이브리드 모델.
 
     설계 목표:
-        - 1분봉 HFT 환경에서 변동성 돌파 구간(|ret|>0.1%)의 방향성 예측
-        - GMADLoss 회귀 학습 타겟: future_ret_1 (log-return)
+        - 1분봉 60개(1시간) 시퀀스로 15분 뒤 추세 방향 이진 분류
+        - 학습 타겟: future_ret_15 > 0 → LONG(1), ≤ 0 → SHORT/FLAT(0)
         - 파라미터 < 200,000 (경량 추론)
         - Sub-millisecond 추론 (T=60 → DWT 후 T=30)
 
@@ -496,9 +498,9 @@ class CryptoMambaClassifier(nn.Module):
         (B, 1) — 예측 로그수익률 (GMADLoss 회귀 / sigmoid 이진 분류 겸용)
 
     학습:
-        손실: GMADLoss(tau=std(future_ret_1), gamma=500)
+        손실: BCEWithLogitsLoss(pos_weight=n_neg/n_pos, 동적 계산)
         옵티마이저: AdamW + clip_grad_norm(max_norm=1.0)
-        데이터셋: btc_1m_hft_v2.parquet (71피처, 2년)
+        데이터셋: btc_1m_hft_v2.parquet (67+피처, 2년, 타겟: future_ret_15)
     """
 
     def __init__(
@@ -552,7 +554,11 @@ class CryptoMambaClassifier(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        # SelectiveScan dt_proj bias는 _SelectiveScan.__init__에서 +2.0으로 설정됨
+        # [Fix 2] _init_weights 루프가 nn.Linear bias를 일괄 0으로 덮어쓰므로,
+        # _SelectiveScan.__init__에서 설정한 dt_proj.bias=+2.0을 루프 후 명시적 복구
+        for stack in (self.low_stack, self.high_stack):
+            for block in stack:
+                nn.init.constant_(block.ssm.dt_proj.bias, 2.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -560,8 +566,8 @@ class CryptoMambaClassifier(nn.Module):
             x: (B, T, F) — 정규화된 피처 시퀀스 (RobustScaler 적용 후)
 
         Returns:
-            (B, 1) — 예측 로그수익률 (GMADLoss 회귀 타겟)
-                      추론 시: output > threshold → LONG, output ≤ threshold → FLAT
+            (B, 1) — 15분 방향 분류 logit (BCEWithLogitsLoss 타겟)
+                      추론 시: sigmoid(output) > 0.5 → LONG, ≤ 0.5 → SHORT/FLAT
         """
         # ① DWT 분해: 추세/노이즈 분리
         low, high = self.dwt(x)           # each (B, T//2, F)
