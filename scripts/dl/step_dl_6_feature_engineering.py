@@ -34,9 +34,12 @@ CVD & Multi-Resolution Features for CryptoMamba Pipeline
 [6] OBV 모멘텀
     obv_slope_5    : 5봉 OBV 변화 / (거래량 평균+ε) — 정규화된 OBV 기울기
 
-[7] 타겟 업데이트 (기존 horizon=60 유지 + 1분 예측 추가)
-    future_ret_1   : log(close[t+1]/close[t]) — GMADL 회귀 타겟
-    target_1m      : 1 if future_ret_1 > fee*2 else 0 — 1분 이진 분류 타겟
+[7] 타겟 (기존 horizon=60 유지 + 1분/15분 예측 추가)
+    future_ret_1   : log(close[t+1]/close[t])               — 1분 회귀 타겟 (GMADL용)
+    target_1m      : 1 if future_ret_1 > fee*2 else 0       — 1분 이진 분류 타겟
+    future_ret_15  : close.pct_change(15).shift(-15)         — 15분 이진 분류 타겟 (★ 메인)
+                     = (close[t+15] - close[t]) / close[t]
+                     > 0 → LONG(1), ≤ 0 → SHORT/FLAT(0)
 ─────────────────────────────────────────────────────────────
 
 실행:
@@ -219,27 +222,37 @@ def add_obv_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_regression_target(df: pd.DataFrame, fee_rate: float = FEE_RATE) -> pd.DataFrame:
-    """[7] 1분 단위 회귀/분류 타겟 추가.
+def add_target_features(df: pd.DataFrame, fee_rate: float = FEE_RATE) -> pd.DataFrame:
+    """[7] 1분/15분 회귀·분류 타겟 추가.
 
     future_ret_1: log(close[t+1] / close[t])
-        → GMADL 손실 함수의 회귀 타겟 (부호 = 방향, 크기 = magnitude)
+        → GMADL 손실 함수의 1분 회귀 타겟 (부호 = 방향, 크기 = magnitude)
 
     target_1m: 1 if future_ret_1 > fee_rate × 2 else 0
-        → 이진 분류 타겟 (수수료 초과 상승만 LONG)
+        → 1분 이진 분류 타겟 (수수료 초과 상승만 LONG)
+
+    future_ret_15: (close[t+15] - close[t]) / close[t]
+        = close.pct_change(15).shift(-15)
+        → ★ 메인 예측 타겟 (15분 방향 이진 분류)
+        > 0 → LONG(1), ≤ 0 → SHORT/FLAT(0)
+        1분 타겟보다 노이즈가 적고 추세 신호가 강함.
 
     Notes:
         기존 target (60분 horizon)과 future_ret (60분)은 그대로 유지.
-        마지막 1행은 미래 데이터 없으므로 NaN.
+        마지막 N행은 미래 데이터 없으므로 NaN (1분→1행, 15분→15행).
     """
     c = df["close"]
 
+    # 1분 타겟 (기존 유지)
     future_ret_1 = np.log(c.shift(-1) / (c + EPS))
     df["future_ret_1"] = future_ret_1
     df["target_1m"]    = (future_ret_1 > fee_rate * 2).astype(np.float32)
-
-    # 마지막 행 NaN 처리 (미래 데이터 없음)
     df.loc[df.index[-1], ["future_ret_1", "target_1m"]] = np.nan
+
+    # 15분 타겟 (★ 메인 — CryptoMamba 학습 타겟)
+    df["future_ret_15"] = c.pct_change(15).shift(-15)
+    # 마지막 15행은 미래 데이터 없으므로 NaN
+    df.loc[df.index[-15:], "future_ret_15"] = np.nan
 
     return df
 
@@ -285,8 +298,8 @@ def build_hft_dataset(
     print("  [6/6] OBV 피처 완료      → obv_slope_5")
 
     # ── 타겟 추가 ─────────────────────────────────────────────────────────
-    df = add_regression_target(df)
-    print("  [+T] 1분 타겟 완료       → future_ret_1, target_1m\n")
+    df = add_target_features(df)
+    print("  [+T] 타겟 완료           → future_ret_1, target_1m, future_ret_15(★메인)\n")
 
     # ── 검증 ──────────────────────────────────────────────────────────────
     new_cols = [c for c in df.columns if c not in pd.read_parquet(input_path).columns]
@@ -323,32 +336,41 @@ def _print_statistics(df: pd.DataFrame) -> None:
     # 타겟 비율
     if "target" in df.columns:
         t60 = df["target"].dropna()
-        print(f"[기존 target   60분] LONG={t60.mean()*100:.2f}%  "
+        print(f"[target   60분] LONG={t60.mean()*100:.2f}%  "
               f"FLAT={(1-t60.mean())*100:.2f}%  N={len(t60):,}")
     if "target_1m" in df.columns:
         t1m = df["target_1m"].dropna()
-        print(f"[신규 target_1m 1분] LONG={t1m.mean()*100:.2f}%  "
+        print(f"[target_1m  1분] LONG={t1m.mean()*100:.2f}%  "
               f"FLAT={(1-t1m.mean())*100:.2f}%  N={len(t1m):,}")
+    if "future_ret_15" in df.columns:
+        fr15 = df["future_ret_15"].dropna()
+        long15 = (fr15 > 0).mean()
+        print(f"[future_ret_15 ★15분] LONG={long15*100:.2f}%  "
+              f"FLAT/SHORT={(1-long15)*100:.2f}%  N={len(fr15):,}")
 
-    # CVD 상관관계
-    if "cvd_20" in df.columns and "future_ret_1" in df.columns:
-        valid = df[["cvd_20", "cvd_60", "cvd_slope_5", "future_ret_1"]].dropna()
-        corr20   = valid["cvd_20"].corr(valid["future_ret_1"])
-        corr60   = valid["cvd_60"].corr(valid["future_ret_1"])
-        corr_sl  = valid["cvd_slope_5"].corr(valid["future_ret_1"])
-        print(f"\n[CVD vs future_ret_1 상관계수]")
-        print(f"  cvd_20:       {corr20:+.6f}")
-        print(f"  cvd_60:       {corr60:+.6f}")
-        print(f"  cvd_slope_5:  {corr_sl:+.6f}")
+    # CVD 상관관계 (1분 vs 15분 비교)
+    if "cvd_20" in df.columns and "future_ret_15" in df.columns:
+        cvd_cols = ["cvd_20", "cvd_60", "cvd_slope_5"]
+        all_cols = cvd_cols + ["future_ret_1", "future_ret_15"]
+        valid = df[[c for c in all_cols if c in df.columns]].dropna()
+        print(f"\n[CVD 상관계수 — 1분 vs 15분 타겟 비교]")
+        print(f"  {'피처':<16s}  {'vs ret_1':>10s}  {'vs ret_15':>10s}")
+        for col in cvd_cols:
+            if col not in valid.columns:
+                continue
+            c1  = valid[col].corr(valid["future_ret_1"])  if "future_ret_1"  in valid.columns else float("nan")
+            c15 = valid[col].corr(valid["future_ret_15"]) if "future_ret_15" in valid.columns else float("nan")
+            print(f"  {col:<16s}  {c1:+.6f}    {c15:+.6f}")
 
     # 미시구조 상관관계
-    if "order_imbalance" in df.columns and "future_ret_1" in df.columns:
-        valid = df[["order_imbalance", "vwap_dev_20", "future_ret_1"]].dropna()
-        corr_oi  = valid["order_imbalance"].corr(valid["future_ret_1"])
-        corr_vw  = valid["vwap_dev_20"].corr(valid["future_ret_1"])
-        print(f"\n[미시구조 vs future_ret_1 상관계수]")
-        print(f"  order_imbalance: {corr_oi:+.6f}")
-        print(f"  vwap_dev_20:     {corr_vw:+.6f}")
+    if "order_imbalance" in df.columns and "future_ret_15" in df.columns:
+        valid = df[["order_imbalance", "vwap_dev_20", "future_ret_1", "future_ret_15"]].dropna()
+        print(f"\n[미시구조 상관계수 — 1분 vs 15분 타겟 비교]")
+        print(f"  {'피처':<20s}  {'vs ret_1':>10s}  {'vs ret_15':>10s}")
+        for col in ["order_imbalance", "vwap_dev_20"]:
+            c1  = valid[col].corr(valid["future_ret_1"])
+            c15 = valid[col].corr(valid["future_ret_15"])
+            print(f"  {col:<20s}  {c1:+.6f}    {c15:+.6f}")
 
     # 볼린저 돌파 빈도
     if "bb_upper_break" in df.columns:
@@ -361,15 +383,23 @@ def _print_statistics(df: pd.DataFrame) -> None:
         print(f"  하단 돌파 : {n_dn:,}회 ({n_dn/n_tot*100:.2f}%)")
         print(f"  스퀴즈 구간: {n_sq:,}행 ({n_sq/n_tot*100:.2f}%)")
 
-    # future_ret_1 분포 (magnitude 분포 — GMADL 가중치에 영향)
+    # future_ret_1 분포 (GMADL 가중치에 영향)
     if "future_ret_1" in df.columns:
         fr = df["future_ret_1"].dropna()
-        print(f"\n[future_ret_1 분포 (GMADL 타겟)]")
-        print(f"  mean  = {fr.mean():+.6f}")
-        print(f"  std   = {fr.std():.6f}")
-        print(f"  |ret| > 0.001 비율: {(fr.abs() > 0.001).mean()*100:.2f}%  (유의미 이동)")
-        print(f"  |ret| > 0.002 비율: {(fr.abs() > 0.002).mean()*100:.2f}%")
-        print(f"  |ret| > 0.005 비율: {(fr.abs() > 0.005).mean()*100:.2f}%")
+        print(f"\n[future_ret_1 분포 (1분 회귀 타겟)]")
+        print(f"  mean={fr.mean():+.6f}  std={fr.std():.6f}")
+        print(f"  |ret|>0.001: {(fr.abs()>0.001).mean()*100:.2f}%  "
+              f"|ret|>0.002: {(fr.abs()>0.002).mean()*100:.2f}%")
+
+    # future_ret_15 분포 (★ 메인 15분 이진 분류 타겟)
+    if "future_ret_15" in df.columns:
+        fr15 = df["future_ret_15"].dropna()
+        print(f"\n[future_ret_15 분포 (★ 15분 메인 타겟)]")
+        print(f"  mean={fr15.mean():+.6f}  std={fr15.std():.6f}  "
+              f"(1분 std 대비 약 {fr15.std()/max(df['future_ret_1'].dropna().std(),1e-9):.1f}배)")
+        print(f"  |ret|>0.003: {(fr15.abs()>0.003).mean()*100:.2f}%  "
+              f"|ret|>0.005: {(fr15.abs()>0.005).mean()*100:.2f}%  "
+              f"|ret|>0.01: {(fr15.abs()>0.01).mean()*100:.2f}%")
 
     print("=" * 60)
 

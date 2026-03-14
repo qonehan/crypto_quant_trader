@@ -23,12 +23,15 @@ GMADL — Generalized Mean Absolute Directional Loss (Step DL-7)
 
   L_smooth(ŷ, y) = SmoothL1(ŷ, y; β_s)      — 미분 안정성 보조항
 
-파라미터 가이드 (future_ret_1, std≈0.000719 기준)
+파라미터 가이드 (future_ret_15, std≈0.0035 기준)
 ─────────────────────────────────────────────────────────────────────────────
-  tau   = 0.000719  (fut_ret_1의 std — tanh 커널 스케일)
-  beta  = 1.0       (선형 magnitude 가중)
-  gamma = 500.0     (exp 평활화: 0.1% 이동 시 ×1.05, 0.5% 이동 시 ×12.2)
-  alpha = 0.70      (방향 손실 70% + smooth 손실 30%)
+  15분 수익률은 1분 수익률보다 변동성(std)이 약 4~5배 크므로 tau를 그에 맞게 조정.
+  tau가 너무 작으면 direction_kernel이 폭발하여 tanh가 상수로 수렴 → L_dir 죽음.
+
+  tau   = 0.0035   (fut_ret_15의 std ≈ 0.35% — tanh 커널 스케일)
+  beta  = 1.0      (선형 magnitude 가중)
+  gamma = 100.0    (exp 평활화: 15분 기준 0.5% 이동 시 ×1.65, 1.0% 이동 시 ×2.72)
+  alpha = 0.70     (방향 손실 70% + smooth 손실 30%)
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ class GMADLoss(nn.Module):
     """Generalized Mean Absolute Directional Loss.
 
     Args:
-        tau        : tanh 커널 스케일 ≈ future_ret_1의 std (default: 7.19e-4)
+        tau        : tanh 커널 스케일 ≈ future_ret_15의 std (default: 3.5e-3)
         beta       : magnitude 지수 (default: 1.0 — 선형 스케일링)
         gamma      : 지수 평활화 계수 (default: 500.0 — 이상 이동 지수적 강조)
         alpha      : L_dir 비율 (default: 0.7; 나머지 0.3 = L_smooth)
@@ -57,7 +60,7 @@ class GMADLoss(nn.Module):
 
     def __init__(
         self,
-        tau: float = 7.19e-4,
+        tau: float = 3.5e-3,
         beta: float = 1.0,
         gamma: float = 500.0,
         alpha: float = 0.70,

@@ -6,12 +6,27 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import json
+from pathlib import Path
 
 import altair as alt
+import numpy as np
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
 from sqlalchemy import text
+
+try:
+    import plotly.graph_objects as go
+    _PLOTLY_OK = True
+except ImportError:
+    _PLOTLY_OK = False
+
+# ── DL 백테스트 결과 경로 ───────────────────────────────────────────────────
+_DL_ARTIFACT = Path(__file__).resolve().parents[1] / "artifacts" / "dl_prod"
+_PREDS_PATH   = _DL_ARTIFACT / "mock_trade_preds.csv"
+_LOG_PATH     = _DL_ARTIFACT / "mock_trade_log.csv"
+_METRICS_PATH = _DL_ARTIFACT / "mock_trade_metrics.json"
+_COST_RATE    = 0.0015   # 수수료 0.05%×2 + 슬리피지 0.05%
 
 from app.config import load_settings
 from app.db.session import get_engine
@@ -1133,6 +1148,301 @@ def render_tab2(engine, settings, now_utc: datetime) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Tab DL — CryptoMamba 백테스트 대시보드
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dl_run_backtest(preds_df: pd.DataFrame, threshold_pct: float) -> tuple[pd.DataFrame, dict]:
+    """preds_df에서 threshold_pct 기준으로 백테스트 수행."""
+    threshold_val = float(np.percentile(preds_df["pred"].values, 100 - threshold_pct))
+    trades = preds_df[preds_df["pred"] >= threshold_val].copy()
+
+    if len(trades) == 0:
+        return pd.DataFrame(), {"n_trades": 0, "total_pnl_pct": 0.0,
+                                 "win_rate_pct": 0.0, "mdd_pct": 0.0,
+                                 "threshold_val": threshold_val}
+
+    trades["net_ret"]  = trades["actual_ret"] - _COST_RATE
+    trades["equity"]   = (1 + trades["net_ret"]).cumprod()
+    trades["cum_pnl"]  = trades["equity"] - 1
+
+    equity      = trades["equity"]
+    mdd         = float((equity / equity.cummax() - 1).min()) * 100
+    total_pnl   = float(trades["cum_pnl"].iloc[-1]) * 100
+    win_rate    = float((trades["net_ret"] > 0).mean()) * 100
+
+    metrics = {
+        "n_trades":      len(trades),
+        "total_pnl_pct": round(total_pnl, 2),
+        "win_rate_pct":  round(win_rate,  1),
+        "mdd_pct":       round(mdd,        2),
+        "threshold_val": round(threshold_val, 6),
+    }
+    return trades, metrics
+
+
+def _dl_build_equity_chart(preds_df: pd.DataFrame, trades: pd.DataFrame) -> None:
+    """Plotly 누적 수익률 곡선 (전략 vs BTC 보유)."""
+    if not _PLOTLY_OK:
+        st.warning("plotly가 설치되지 않았습니다. `pip install plotly` 후 재시작하세요.")
+        return
+
+    # BTC 보유 수익률 (전체 테스트 구간)
+    btc_curve = preds_df["close"] / preds_df["close"].iloc[0] - 1
+
+    # 전략 수익률 (거래 시점에만 스텝)
+    if len(trades) == 0:
+        st.info("선택한 threshold에서 진입 신호가 없습니다.")
+        return
+
+    # 전략 equity를 전체 시간축에 forward-fill
+    strat_equity = pd.Series(1.0, index=preds_df.index)
+    strat_equity.loc[trades.index] = trades["equity"].values
+    strat_equity = strat_equity.ffill()
+    strat_curve  = strat_equity - 1
+
+    fig = go.Figure()
+
+    # BTC 보유
+    fig.add_trace(go.Scatter(
+        x=btc_curve.index, y=(btc_curve * 100).values,
+        name="BTC 보유 (Buy & Hold)",
+        line=dict(color="#f7931a", width=1.5, dash="dot"),
+        opacity=0.75,
+    ))
+
+    # 전략 수익률
+    pnl_color = "#2563eb" if strat_curve.iloc[-1] >= 0 else "#dc2626"
+    fig.add_trace(go.Scatter(
+        x=strat_curve.index, y=(strat_curve * 100).values,
+        name="CryptoMamba 전략",
+        line=dict(color=pnl_color, width=2.2),
+        fill="tozeroy",
+        fillcolor=f"rgba(37,99,235,0.08)",
+    ))
+
+    fig.update_layout(
+        title="누적 수익률 (%) — 전략 vs BTC 보유",
+        xaxis_title="날짜",
+        yaxis_title="누적 수익률 (%)",
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.05, x=0),
+        height=420,
+        margin=dict(l=20, r=20, t=50, b=30),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(gridcolor="#e5e7eb"),
+        yaxis=dict(gridcolor="#e5e7eb", zeroline=True, zerolinecolor="#9ca3af"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_tab_dl() -> None:
+    """Tab DL: CryptoMamba 15분 GMADLoss 백테스트 결과 대시보드."""
+
+    # ── 사이드바: 진입 threshold 슬라이더 ───────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🤖 DL 백테스트 설정")
+    threshold_pct = st.sidebar.slider(
+        "롱 진입 기준 — 상위 몇 % 예측값",
+        min_value=1, max_value=40, value=10, step=1,
+        help="모델 예측값이 상위 N% 이상일 때만 롱 진입. 낮을수록 선별적 진입.",
+    )
+    st.sidebar.caption(f"현재: 상위 **{threshold_pct}%** 진입  (비용 0.15% 공제)")
+
+    # ── 헤더 ────────────────────────────────────────────────────────────
+    st.markdown("## 🤖 CryptoMamba 백테스트 — 15분 방향 예측 알파")
+    st.caption("GMADLoss 회귀 모델 · 롱 전용 돌파 전략 · 업비트 수수료+슬리피지 0.15% 공제")
+
+    # ── 파일 존재 확인 ───────────────────────────────────────────────────
+    if not _PREDS_PATH.exists():
+        st.warning(
+            "📭 백테스트 결과 파일이 없습니다.\n\n"
+            "아래 명령어를 먼저 실행해 주세요:\n"
+            "```bash\n"
+            "poetry run python scripts/dl/step_dl_10_mock_trade.py\n"
+            "```"
+        )
+        return
+
+    # ── 데이터 로드 ──────────────────────────────────────────────────────
+    @st.cache_data(ttl=300)
+    def _load_preds() -> pd.DataFrame:
+        df = pd.read_csv(_PREDS_PATH, index_col="timestamp", parse_dates=True)
+        return df
+
+    preds_df = _load_preds()
+
+    # ── 동적 백테스트 ────────────────────────────────────────────────────
+    trades, metrics = _dl_run_backtest(preds_df, threshold_pct)
+
+    btc_hold_pct = float(
+        preds_df["close"].iloc[-1] / preds_df["close"].iloc[0] - 1
+    ) * 100
+    alpha_pct = metrics["total_pnl_pct"] - btc_hold_pct
+
+    # ── KPI 메트릭 ───────────────────────────────────────────────────────
+    st.markdown("### 📊 핵심 성과 지표 (KPI)")
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    pnl_delta = f"알파 {alpha_pct:+.2f}% vs BTC"
+    c1.metric("💰 누적 수익률",   f"{metrics['total_pnl_pct']:+.2f}%", delta=pnl_delta)
+    c2.metric("🏆 승률",          f"{metrics['win_rate_pct']:.1f}%")
+    c3.metric("📉 MDD",           f"{metrics['mdd_pct']:.2f}%")
+    c4.metric("🔢 총 거래 횟수",  f"{metrics['n_trades']:,}건")
+    c5.metric("₿ BTC 보유",       f"{btc_hold_pct:+.2f}%")
+
+    # 진입 임계값 표시
+    st.caption(
+        f"진입 기준: pred ≥ **{metrics['threshold_val']:+.6f}**  "
+        f"(상위 {threshold_pct}% 분위수) · "
+        f"테스트 기간: {str(preds_df.index[0])[:10]} ~ {str(preds_df.index[-1])[:10]}"
+    )
+
+    st.markdown("---")
+
+    # ── 누적 수익률 차트 ─────────────────────────────────────────────────
+    st.markdown("### 📈 누적 수익률 곡선")
+    _dl_build_equity_chart(preds_df, trades)
+
+    st.markdown("---")
+
+    # ── Threshold 민감도 테이블 ──────────────────────────────────────────
+    st.markdown("### 🎯 Threshold 민감도 분석")
+
+    sens_rows = []
+    for pct in [5, 10, 15, 20, 25, 30]:
+        _, m = _dl_run_backtest(preds_df, pct)
+        sens_rows.append({
+            "진입 상위%": f"상위 {pct}%",
+            "거래 횟수":  m["n_trades"],
+            "누적수익률": f"{m['total_pnl_pct']:+.2f}%",
+            "승률":       f"{m['win_rate_pct']:.1f}%",
+            "MDD":        f"{m['mdd_pct']:.2f}%",
+            "진입 임계값": f"{m['threshold_val']:+.6f}",
+        })
+    sens_df = pd.DataFrame(sens_rows)
+
+    # 현재 선택된 threshold 행 강조
+    def _highlight_selected(row: pd.Series) -> list[str]:
+        is_sel = row["진입 상위%"] == f"상위 {threshold_pct}%"
+        return ["background-color: #dbeafe; font-weight: bold" if is_sel else "" for _ in row]
+
+    st.dataframe(
+        sens_df.style.apply(_highlight_selected, axis=1),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.markdown("---")
+
+    # ── 최근 매매 로그 ───────────────────────────────────────────────────
+    st.markdown(f"### 📋 최근 매매 내역 (상위 {threshold_pct}% 기준, 최근 50건)")
+
+    if len(trades) == 0:
+        st.info("현재 threshold에서 매매 내역이 없습니다.")
+    else:
+        display_cols = {
+            "close":      "진입가 (KRW)",
+            "pred":       "모델 예측값",
+            "actual_ret": "15분 실제 수익률",
+            "net_ret":    "순수익률 (비용 후)",
+            "cum_pnl":    "누적 PnL",
+        }
+        disp = (
+            trades[list(display_cols.keys())]
+            .tail(50)
+            .rename(columns=display_cols)
+            .copy()
+        )
+        disp["진입가 (KRW)"]     = disp["진입가 (KRW)"].map("{:,.0f}".format)
+        disp["모델 예측값"]       = disp["모델 예측값"].map("{:+.6f}".format)
+        disp["15분 실제 수익률"]  = disp["15분 실제 수익률"].map("{:+.4%}".format)
+        disp["순수익률 (비용 후)"]= disp["순수익률 (비용 후)"].map("{:+.4%}".format)
+        disp["누적 PnL"]          = disp["누적 PnL"].map("{:+.4%}".format)
+
+        def _color_ret(row: pd.Series) -> list[str]:
+            ret_val = trades.loc[row.name, "net_ret"]
+            color = "#dcfce7" if ret_val > 0 else "#fee2e2"
+            return [f"background-color: {color}" for _ in row]
+
+        st.dataframe(
+            disp.style.apply(_color_ret, axis=1),
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+
+    # ── 예측값 분포 ──────────────────────────────────────────────────────
+    with st.expander("📊 모델 예측값 분포 보기"):
+        if _PLOTLY_OK:
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Histogram(
+                x=preds_df["pred"].values,
+                nbinsx=80,
+                marker_color="#6366f1",
+                opacity=0.75,
+                name="예측값 분포",
+            ))
+            # 현재 threshold 수직선
+            fig_hist.add_vline(
+                x=metrics["threshold_val"],
+                line_color="#dc2626", line_width=2, line_dash="dash",
+                annotation_text=f"진입 기준 ({threshold_pct}%)",
+                annotation_position="top right",
+            )
+            fig_hist.update_layout(
+                title="모델 예측값(pred) 히스토그램",
+                xaxis_title="pred (15분 예측 수익률)",
+                yaxis_title="빈도",
+                height=300, margin=dict(l=20, r=20, t=40, b=30),
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**예측값 분포 통계**")
+            p = preds_df["pred"]
+            stats = pd.DataFrame({
+                "지표": ["평균", "표준편차", "최솟값", "Q10", "Q50(중앙값)", "Q90", "최댓값"],
+                "값":   [f"{p.mean():+.6f}", f"{p.std():.6f}",
+                          f"{p.min():+.6f}", f"{np.percentile(p,10):+.6f}",
+                          f"{np.percentile(p,50):+.6f}", f"{np.percentile(p,90):+.6f}",
+                          f"{p.max():+.6f}"],
+            })
+            st.dataframe(stats, hide_index=True, use_container_width=True)
+        with col_b:
+            st.markdown("**방향 정확도 (|ret|≥0.01% 필터)**")
+            mag_mask = preds_df["actual_ret"].abs() >= 1e-4
+            if mag_mask.sum() > 0:
+                dir_all = float(
+                    (np.sign(preds_df["pred"]) == np.sign(preds_df["actual_ret"])).mean()
+                ) * 100
+                dir_flt = float(
+                    (np.sign(preds_df.loc[mag_mask, "pred"]) ==
+                     np.sign(preds_df.loc[mag_mask, "actual_ret"])).mean()
+                ) * 100
+                acc_df = pd.DataFrame({
+                    "구분": ["전체 샘플", f"|ret|≥0.01% ({mag_mask.sum():,}건)"],
+                    "방향 정확도": [f"{dir_all:.1f}%", f"{dir_flt:.1f}%"],
+                })
+                st.dataframe(acc_df, hide_index=True, use_container_width=True)
+
+    # ── 저장된 성과 파일 정보 ────────────────────────────────────────────
+    with st.expander("💾 저장 파일 정보"):
+        files_info = [
+            (_PREDS_PATH,   "전체 예측값 (인터랙티브용)"),
+            (_LOG_PATH,     "기본 매매 로그"),
+            (_METRICS_PATH, "성과 지표 JSON"),
+        ]
+        for fpath, desc in files_info:
+            if fpath.exists():
+                size_kb = fpath.stat().st_size / 1024
+                st.markdown(f"✅ `{fpath.name}` — {desc} ({size_kb:.1f} KB)")
+            else:
+                st.markdown(f"❌ `{fpath.name}` — {desc} (미생성)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1181,13 +1491,16 @@ def main() -> None:
             st.error(f"DB 연결 실패: {e}")
         return
 
-    tab1, tab2 = st.tabs(["📊 직관적인 요약 (메인)", "🔬 세부 계산 데이터 (전문가용)"])
+    tab1, tab2, tab_dl = st.tabs(["📊 직관적인 요약 (메인)", "🔬 세부 계산 데이터 (전문가용)", "🤖 DL 백테스트"])
 
     with tab1:
         render_tab1(engine, settings, now_utc)
 
     with tab2:
         render_tab2(engine, settings, now_utc)
+
+    with tab_dl:
+        render_tab_dl()
 
     # 5초마다 자동 갱신
     import time as _time
