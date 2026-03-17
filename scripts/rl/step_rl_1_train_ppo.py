@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-scripts/rl/step_rl_1_train_ppo.py  —  Two-Stage RL PPO 학습 파이프라인
-========================================================================
+scripts/rl/step_rl_1_train_ppo.py  —  Two-Stage RL PPO 학습 파이프라인 (Discrete Action)
+=========================================================================================
 
 전체 흐름
 ----------
@@ -90,15 +90,17 @@ EXCLUDE_COLS: frozenset[str] = frozenset(
 TRAIN_RATIO = 0.80
 VAL_RATIO = 0.10
 
-# RL 환경 기본 파라미터
+# RL 환경 기본 파라미터 (Discrete Action)
 ENV_KWARGS: dict[str, Any] = {
     "window_size": 10,
     "fee_rate": 0.0005,
-    "whipsaw_coeff": 0.001,
-    "max_position": 1.0,
+    "action_change_penalty": 2.0,   # 포지션 변경 시 고정 패널티 (bps)
+    "whipsaw_coeff": 0.0,           # 이산형에서는 비활성화 (action_change_penalty로 대체)
 }
 
 # PPO 기본 하이퍼파라미터
+# Discrete action space에서 SB3 PPO는 별도 설정 없이 자동 호환됨.
+# (MlpPolicy가 Categorical 분포를 자동으로 사용)
 PPO_KWARGS: dict[str, Any] = {
     "learning_rate": 3e-4,
     "n_steps": 2048,
@@ -107,7 +109,7 @@ PPO_KWARGS: dict[str, Any] = {
     "gamma": 0.99,
     "gae_lambda": 0.95,
     "clip_range": 0.2,
-    "ent_coef": 0.005,
+    "ent_coef": 0.01,    # Discrete 환경에서 탐색 강화를 위해 0.005→0.01 상향
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
     "verbose": 1,
@@ -338,7 +340,8 @@ class ValRewardCallback(BaseCallback):
             total_reward = 0.0
             while not done:
                 action, _ = self.model.predict(obs, deterministic=True)
-                obs, r, done, _, _ = env.step(action)
+                # Discrete 환경: action은 numpy scalar 또는 (1,) 배열 → int 변환
+                obs, r, done, _, _ = env.step(int(action))
                 total_reward += r
             if self.verbose > 0:
                 print(
@@ -364,6 +367,8 @@ def train_ppo(
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     TB_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+    # SB3 PPO는 Discrete(3) action_space를 자동 감지하여
+    # MlpPolicy 내부에서 Categorical 분포를 사용함 → 별도 설정 불필요
     model = PPO(
         policy="MlpPolicy",
         env=train_env,
@@ -391,7 +396,7 @@ def train_ppo(
     model.learn(
         total_timesteps=total_timesteps,
         callback=callbacks,
-        tb_log_name="ppo_crypto",
+        tb_log_name="ppo_crypto_discrete",
         reset_num_timesteps=True,
         progress_bar=True,
     )
@@ -485,6 +490,10 @@ def run_agent_on_test(
     VecNormalize auto-reset 로 인한 trajectory 유실 방지:
     raw CryptoTradingEnv 를 직접 구동하고, VecNormalize 통계로
     관측값을 수동 정규화하여 model.predict() 에 전달.
+
+    Discrete Action 처리:
+    model.predict()가 반환하는 action (numpy scalar 또는 배열)을
+    int()로 변환한 뒤 raw_env.step()에 전달.
     """
     print("\n[5/7] Test 구간 에이전트 시뮬레이션")
 
@@ -512,9 +521,9 @@ def run_agent_on_test(
     while not terminated:
         obs_norm = _normalize(obs_raw)
         action, _ = model.predict(obs_norm, deterministic=True)
-        # model.predict 가 (1,1) shape 반환할 수 있으므로 flatten
-        action_scalar = np.array([float(action.flatten()[0])])
-        obs_raw, _, terminated, _, _ = raw_env.step(action_scalar)
+        # Discrete 환경: action은 numpy scalar or shape-(1,) 배열 → int 변환
+        action_int = int(action.flatten()[0])
+        obs_raw, _, terminated, _, _ = raw_env.step(action_int)
 
     traj = raw_env.get_trajectory()
     print(f"  시뮬레이션 완료: {len(traj):,} 스텝")
@@ -542,6 +551,7 @@ def baseline_buy_and_hold(test_df: pd.DataFrame) -> pd.DataFrame:
                 "log_ret": lr,
                 "pnl_bps": lr * 10_000.0,
                 "fee_bps": 5.0 if i == 0 else 0.0,  # 진입 수수료 1회
+                "fixed_penalty_bps": 0.0,
                 "whipsaw_penalty": 0.0,
                 "reward": 0.0,
                 "xgb_prob": 0.5,
@@ -601,6 +611,7 @@ def baseline_xgb_only(
                 "log_ret": log_ret,
                 "pnl_bps": pnl_bps,
                 "fee_bps": fee_bps,
+                "fixed_penalty_bps": 0.0,
                 "whipsaw_penalty": 0.0,
                 "reward": pnl_bps - fee_bps,
                 "xgb_prob": prob,
@@ -618,57 +629,46 @@ def baseline_xgb_only(
 
 
 def analyze_betting_behavior(traj: pd.DataFrame) -> str:
-    """에이전트가 어떤 오라클 조합에서 큰 베팅을 하는지 분석."""
+    """에이전트가 어떤 오라클 조합에서 어떤 포지션을 선택하는지 분석."""
     lines = []
 
-    # 상위 10% 베팅 구간 필터
-    big_bet_thresh = traj["position"].abs().quantile(0.9)
-    big = traj[traj["position"].abs() >= big_bet_thresh].copy()
+    # Discrete 액션 분포 요약
+    if "action" in traj.columns:
+        action_counts = traj["action"].value_counts().sort_index()
+        total = len(traj)
+        lines.append("### 에이전트 액션 분포 (Discrete)")
+        lines.append("")
+        lines.append("| 액션 | 포지션 | 횟수 | 비율 |")
+        lines.append("|---|---|---|---|")
+        action_labels = {0: "풀 숏 (-1.0)", 1: "관망 (0.0)", 2: "풀 롱 (+1.0)"}
+        for a in [0, 1, 2]:
+            cnt = int(action_counts.get(a, 0))
+            lines.append(
+                f"| {a} | {action_labels[a]} | {cnt:,} | {cnt/total*100:.1f}% |"
+            )
+        lines.append("")
 
-    if big.empty:
-        return "  (분석 데이터 없음)"
+    # 포지션 변경 횟수
+    if "delta" in traj.columns:
+        n_switches = int((traj["delta"].abs() > 1e-3).sum())
+        lines.append(f"- **포지션 변경 횟수**: {n_switches:,}회")
+        lines.append(
+            f"- **포지션 변경률**: {n_switches / len(traj) * 100:.2f}% "
+            f"({n_switches:,} / {len(traj):,} 스텝)"
+        )
+        lines.append("")
 
-    lines.append("### 에이전트 큰 베팅(상위 10%) 분석")
+    # xgb_prob 분포 (포지션별)
+    lines.append("### 오라클 신호별 포지션 선택 분석")
     lines.append("")
 
-    # xgb_prob 분포
-    lines.append("**XGBoost Prob 분포 (큰 베팅 vs 전체)**")
-    lines.append(
-        f"- 큰 롱 베팅 구간 평균 prob: "
-        f"{big[big['position'] > 0]['xgb_prob'].mean():.4f}"
-    )
-    lines.append(
-        f"- 큰 숏 베팅 구간 평균 prob: "
-        f"{big[big['position'] < 0]['xgb_prob'].mean():.4f}"
-    )
-    lines.append(
-        f"- 전체 평균 prob: {traj['xgb_prob'].mean():.4f}"
-    )
-    lines.append("")
-
-    # ridge_pred 분포
-    lines.append("**Ridge Pred 분포 (큰 베팅 vs 전체)**")
-    lines.append(
-        f"- 큰 롱 베팅 구간 평균 ridge_pred: "
-        f"{big[big['position'] > 0]['ridge_pred'].mean():.6f}"
-    )
-    lines.append(
-        f"- 큰 숏 베팅 구간 평균 ridge_pred: "
-        f"{big[big['position'] < 0]['ridge_pred'].mean():.6f}"
-    )
-    lines.append(
-        f"- 전체 평균 ridge_pred: {traj['ridge_pred'].mean():.6f}"
-    )
-    lines.append("")
-
-    # prob / ridge 조합 분석 (4사분면)
     traj["prob_bucket"] = pd.cut(traj["xgb_prob"], bins=[0, 0.4, 0.5, 0.6, 1.0],
                                   labels=["낮음(<0.4)", "중립(0.4-0.5)",
                                           "중립(0.5-0.6)", "높음(>0.6)"])
     traj["pred_bucket"] = pd.cut(traj["ridge_pred"],
                                   bins=[-np.inf, -0.001, 0.001, np.inf],
                                   labels=["음수(<-0.001)", "중립", "양수(>0.001)"])
-    lines.append("**prob × pred 조합별 평균 포지션 크기**")
+    lines.append("**prob × pred 조합별 평균 포지션 & PnL**")
     lines.append("")
     lines.append("| XGB Prob 구간 | Ridge Pred 구간 | 평균 포지션 | 평균 PnL(bps) |")
     lines.append("|---|---|---|---|")
@@ -707,12 +707,16 @@ def generate_report(
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     W = env_kwargs["window_size"]
     FEE = env_kwargs["fee_rate"] * 100
-    LAMBDA = env_kwargs["whipsaw_coeff"]
+    ACP = env_kwargs.get("action_change_penalty", 2.0)
 
     insight = analyze_betting_behavior(rl_traj.copy())
 
+    # 포지션 변경 횟수 계산
+    n_switches = int((rl_traj["delta"].abs() > 1e-3).sum())
+    total_fixed_penalty = float(rl_traj.get("fixed_penalty_bps", pd.Series([0])).sum())
+
     lines = [
-        "# Two-Stage RL Trading Agent — 학습 결과 보고서",
+        "# Two-Stage RL Trading Agent — 학습 결과 보고서 (Discrete Action)",
         "",
         f"> 생성일시: {now}  |  총 학습 시간: {elapsed_train/60:.1f}분",
         f"> 테스트 구간: {test_date_range[0]} ~ {test_date_range[1]}",
@@ -742,38 +746,45 @@ def generate_report(
         "",
         f"- **window_size**: {W} (과거 {W}분 슬라이딩 윈도우)",
         "- **피처 스케일링**: RobustScaler (Train 구간 fit, 전체 transform)",
-        "- **position**: 현재 보유 포지션 ∈ [-1, 1]",
+        "- **position**: 현재 보유 포지션 ∈ {-1.0, 0.0, +1.0}",
         "- **unrealized_pnl_bps**: 진입가 대비 미실현 손익 (단위: bps)",
         "",
-        "### 1.3 액션(Action) 설계",
+        "### 1.3 액션(Action) 설계 — Discrete(3)",
         "",
         "```",
-        "a_t ∈ Box(-1.0, 1.0, shape=(1,))",
+        "a_t ∈ Discrete(3)",
         "",
-        "  -1.0 = 풀 숏 (Short 100%)     0.0 = 포지션 청산/관망     +1.0 = 풀 롱 (Long 100%)",
+        "  Action 0 → 포지션 -1.0  (풀 숏, Short 100%)",
+        "  Action 1 → 포지션  0.0  (관망 / 전액 청산)",
+        "  Action 2 → 포지션 +1.0  (풀 롱, Long 100%)",
         "```",
         "",
-        "- 연속형 공간 → 포지션 크기와 방향을 동시에 결정",
-        "- **Δpos** = target_position − prev_position",
+        "- 이산형 공간 → 명확한 3가지 포지션만 허용, 미세 조정 불가",
+        "- SB3 PPO의 MlpPolicy는 Discrete action space를 자동 감지하여",
+        "  내부적으로 Categorical 분포를 사용 (별도 설정 불필요)",
+        "- **Δpos** = target_position − prev_position ∈ {-2, -1, 0, +1, +2}",
         "",
         "### 1.4 보상(Reward) 함수",
         "",
         "$$",
         r"r_t = \underbrace{p_t \cdot \log\!\left(\frac{P_{t+1}}{P_t}\right) \times 10^4}_{\text{1-step PnL (bps)}}",
-        r"    - \underbrace{|\Delta p_t| \cdot f \times 10^4}_{\text{수수료}}",
-        r"    - \underbrace{\lambda \cdot \Delta p_t^2}_{\text{휩소 패널티}}",
+        r"    - \underbrace{|\Delta p_t| \cdot f \times 10^4}_{\text{거래 수수료}}",
+        r"    - \underbrace{\mathbb{1}[\Delta p_t \neq 0] \cdot \alpha}_{\text{행동 변경 패널티 (고정)}}",
         "$$",
         "",
         "| 기호 | 의미 | 값 |",
         "|---|---|---|",
-        f"| $p_t$ | 현재 포지션 | ∈ [-1, 1] |",
+        f"| $p_t$ | 현재 포지션 | ∈ {{-1, 0, +1}} |",
         f"| $P_t$ | t봉 종가 | — |",
         f"| $f$ | 단방향 수수료율 | {FEE:.2f}% |",
-        f"| $\\lambda$ | 휩소 패널티 계수 | {LAMBDA} |",
+        f"| $\\alpha$ | 행동 변경 고정 패널티 | {ACP} bps |",
         f"| $\\Delta p_t$ | 포지션 변화량 | — |",
         "",
-        "- 보상 단위: **bps (basis points, 1/100%)** → 해석 가능한 스케일 확보",
-        "- 이차 휩소 패널티: 소폭 조정은 관용, 급격한 방향 전환은 강하게 억제",
+        f"- 보상 단위: **bps (basis points, 1/100%)**",
+        f"- 고정 행동 변경 패널티 `{ACP} bps`: 포지션이 실제로 바뀔 때만 1회 부과.",
+        "  수수료와 별개로 추가되어 의미 없는 포지션 스위칭을 강력히 억제.",
+        "- 연속형 이차 휩소 패널티(`whipsaw_coeff`)는 비활성화(0.0). ",
+        "  이산형 환경에서는 고정 패널티가 동일한 역할을 더 명확하게 수행.",
         "",
         "---",
         "",
@@ -785,13 +796,15 @@ def generate_report(
         f"- **누적 보상**: {rl_traj['reward'].sum():.2f} bps",
         f"- **누적 순수익**: {rl_traj['pnl_bps'].sum() - rl_traj['fee_bps'].sum():.2f} bps",
         f"- **총 수수료**: {rl_traj['fee_bps'].sum():.2f} bps",
-        f"- **총 거래 횟수**: {(rl_traj['delta'].abs() > 0.01).sum():,}",
+        f"- **총 고정 패널티**: {total_fixed_penalty:.2f} bps",
+        f"- **포지션 변경 횟수**: {n_switches:,}회",
+        f"- **포지션 변경률**: {n_switches / len(rl_traj) * 100:.2f}%",
         "",
         "---",
         "",
         "## 3. 전략 비교 표",
         "",
-        "| 지표 | Buy & Hold | XGBoost-only | **PPO RL** |",
+        "| 지표 | Buy & Hold | XGBoost-only | **PPO RL (Discrete)** |",
         "|---|---|---|---|",
         f"| 누적 수익률 (%) | {bh_metrics['total_return_pct']:.4f}% "
         f"| {xgb_metrics['total_return_pct']:.4f}% "
@@ -823,9 +836,10 @@ def generate_report(
         "## 5. 학습 설정 요약",
         "",
         f"- **알고리즘**: PPO (Stable-Baselines3 v{_get_sb3_version()})",
+        f"- **액션 공간**: Discrete(3) — 풀숏 / 관망 / 풀롱",
         f"- **총 학습 스텝**: {train_timesteps:,}",
         f"- **학습 소요 시간**: {elapsed_train/60:.1f}분",
-        f"- **Policy 네트워크**: MlpPolicy (64-64 기본)",
+        f"- **Policy 네트워크**: MlpPolicy (Categorical 분포, 64-64 기본)",
         f"- **데이터 분할**: Train 80% / Val 10% / Test 10%",
         f"- **오라클 저장 경로**: `artifacts/rl_prod/oracles/`",
         f"- **모델 저장 경로**: `artifacts/rl_prod/ppo_final.zip`",
@@ -838,8 +852,15 @@ def generate_report(
         f"  gamma       = {PPO_KWARGS['gamma']}",
         f"  gae_lambda  = {PPO_KWARGS['gae_lambda']}",
         f"  clip_range  = {PPO_KWARGS['clip_range']}",
-        f"  ent_coef    = {PPO_KWARGS['ent_coef']}",
+        f"  ent_coef    = {PPO_KWARGS['ent_coef']}  (Discrete 탐색 강화)",
         f"  lr          = {PPO_KWARGS['learning_rate']}",
+        "```",
+        "",
+        "```",
+        f"환경 파라미터:",
+        f"  fee_rate             = {ENV_KWARGS['fee_rate']} (0.05% 단방향)",
+        f"  action_change_penalty= {ENV_KWARGS['action_change_penalty']} bps (포지션 변경 시 고정 패널티)",
+        f"  whipsaw_coeff        = {ENV_KWARGS['whipsaw_coeff']} (비활성화)",
         "```",
         "",
         "---",
@@ -865,7 +886,7 @@ def _get_sb3_version() -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="PPO RL 트레이딩 학습 파이프라인")
+    p = argparse.ArgumentParser(description="PPO RL 트레이딩 학습 파이프라인 (Discrete Action)")
     p.add_argument(
         "--timesteps",
         type=int,
@@ -980,7 +1001,7 @@ def main() -> None:
     bh_traj = baseline_buy_and_hold(df_test)
     xgb_traj = baseline_xgb_only(df_test, threshold=0.5, fee_rate=ENV_KWARGS["fee_rate"])
 
-    rl_metrics = compute_metrics(rl_traj, "PPO RL")
+    rl_metrics = compute_metrics(rl_traj, "PPO RL (Discrete)")
     bh_metrics = compute_metrics(bh_traj, "Buy & Hold")
     xgb_metrics = compute_metrics(xgb_traj, "XGBoost-only")
 
@@ -990,7 +1011,7 @@ def main() -> None:
     print("═" * 60)
     for m in [bh_metrics, xgb_metrics, rl_metrics]:
         print(
-            f"  {m['label']:20s}  수익률={m['total_return_pct']:+.4f}%  "
+            f"  {m['label']:25s}  수익률={m['total_return_pct']:+.4f}%  "
             f"MDD={m['mdd_pct']:.4f}%  Sharpe={m['sharpe']:.3f}  "
             f"거래={m['n_trades']:,}  승률={m['win_rate_pct']:.1f}%"
         )

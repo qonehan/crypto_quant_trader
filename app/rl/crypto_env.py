@@ -2,13 +2,17 @@
 app/rl/crypto_env.py — CryptoTradingEnv  (Two-Stage RL Trading Environment)
 =============================================================================
 
-Gymnasium 인터페이스를 준수하는 BTC 1분봉 연속 액션 트레이딩 환경.
+Gymnasium 인터페이스를 준수하는 BTC 1분봉 이산형 액션 트레이딩 환경.
 
 설계 원칙
 ----------
 - 오라클 추론은 환경 외부에서 사전 계산 → 'xgb_prob', 'ridge_pred' 열로 주입
-- 연속형 액션: target_position ∈ [-1, 1]  (-1=풀숏, 0=관망, +1=풀롱)
-- 포지션 변화(delta)에 비례하는 수수료 + 이차 휩소 패널티
+- 이산형 액션: Discrete(3)
+    Action 0 → 포지션 -1.0  (풀 숏)
+    Action 1 → 포지션  0.0  (관망 / 전액 청산)
+    Action 2 → 포지션 +1.0  (풀 롱)
+- 포지션 변화 시 수수료 + 고정 행동 변경 패널티(action_change_penalty)로
+  의미 없는 포지션 스위칭을 강력히 억제
 
 Observation (1-D flat vector, float32)
 ----------------------------------------
@@ -21,11 +25,13 @@ Reward  (단위: basis points, 1 bps = 0.01%)
 ---------------------------------------------
   r_t = pos_t × log(P_{t+1} / P_t) × 10_000        ← 미실현 → 실현 PnL
        - |Δpos_t| × fee_rate × 10_000                ← 거래 수수료
-       - whipsaw_coeff × Δpos_t²                     ← 빈번한 방향 전환 패널티
+       - action_change_penalty  (포지션이 실제로 변경될 때만)
+       - whipsaw_coeff × Δpos_t²                     ← 선택적 이차 패널티 (기본 0)
 
   여기서:
     Δpos_t = target_pos - pos_{t-1}
-    fee_rate = 0.0005 (0.05% 단방향, 왕복이면 2× = 0.1%)
+    fee_rate = 0.0005 (0.05% 단방향)
+    action_change_penalty = 2.0 bps (기본; 포지션 변경 시 1회 고정 부과)
 
 Usage Example
 --------------
@@ -37,7 +43,7 @@ Usage Example
         window_size=10,
     )
     obs, info = env.reset()
-    obs, reward, terminated, truncated, info = env.step(np.array([0.5]))
+    obs, reward, terminated, truncated, info = env.step(2)   # Action 2 = 풀롱
 """
 
 from __future__ import annotations
@@ -54,6 +60,13 @@ from gymnasium import spaces
 # ══════════════════════════════════════════════════════════════════════════════
 
 REWARD_SCALE = 10_000.0   # PnL 단위를 bps로 변환 (1 bps = 0.01%)
+
+# 이산형 액션 → 목표 포지션 매핑
+_ACTION_TO_POSITION: dict[int, float] = {
+    0: -1.0,   # 풀 숏
+    1:  0.0,   # 관망 / 전액 청산
+    2:  1.0,   # 풀 롱
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,10 +88,12 @@ class CryptoTradingEnv(gym.Env):
         슬라이딩 윈도우 크기 (분봉 개수). 기본 10.
     fee_rate : float
         단방향 수수료율. 기본 0.0005 (0.05%).
+    action_change_penalty : float
+        포지션이 실제로 변경될 때 부과하는 고정 패널티 (단위: bps). 기본 2.0.
+        수수료와 별개로 추가 부과되어 잦은 포지션 스위칭을 강력히 억제.
     whipsaw_coeff : float
-        포지션 변화의 이차 패널티 계수 (λ_w × Δpos²). 기본 0.001.
-    max_position : float
-        허용 최대 포지션 절대값. 기본 1.0.
+        포지션 변화의 이차 패널티 계수 (λ_w × Δpos²). 기본 0.0.
+        이산형 환경에서는 action_change_penalty 로 대체하므로 기본 비활성화.
     """
 
     metadata: dict[str, Any] = {"render_modes": []}
@@ -89,7 +104,9 @@ class CryptoTradingEnv(gym.Env):
         feature_cols: list[str],
         window_size: int = 10,
         fee_rate: float = 0.0005,
-        whipsaw_coeff: float = 0.001,
+        action_change_penalty: float = 2.0,
+        whipsaw_coeff: float = 0.0,
+        # max_position은 이산형 환경에서 사용되지 않지만 하위 호환성을 위해 유지
         max_position: float = 1.0,
     ) -> None:
         super().__init__()
@@ -102,8 +119,9 @@ class CryptoTradingEnv(gym.Env):
         # ── 하이퍼파라미터 ──────────────────────────────────────────────────
         self.window_size = window_size
         self.fee_rate = fee_rate
+        self.action_change_penalty = action_change_penalty
         self.whipsaw_coeff = whipsaw_coeff
-        self.max_position = max_position
+        self.max_position = max_position   # 이산형에서는 미사용 (호환성 보존)
 
         # ── 유효 스텝 범위: window_size ≤ idx ≤ N-2 (next close 필요) ──────
         self._n_rows = len(self.df)
@@ -122,12 +140,8 @@ class CryptoTradingEnv(gym.Env):
             shape=(n_obs,),
             dtype=np.float32,
         )
-        self.action_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(1,),
-            dtype=np.float32,
-        )
+        # 이산형 액션 공간: 0=풀숏, 1=관망, 2=풀롱
+        self.action_space = spaces.Discrete(3)
 
         # ── 내부 상태 초기화 ─────────────────────────────────────────────────
         self._step: int = 0
@@ -203,22 +217,21 @@ class CryptoTradingEnv(gym.Env):
         return obs, {}
 
     def step(
-        self, action: np.ndarray
+        self, action: int | np.integer
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
         """
         Parameters
         ----------
-        action : np.ndarray shape (1,)
-            목표 포지션 [-1, 1].
+        action : int  ∈ {0, 1, 2}
+            0 → 풀 숏 (-1.0),  1 → 관망 (0.0),  2 → 풀 롱 (+1.0)
 
         Returns
         -------
         obs, reward (bps), terminated, truncated=False, info
         """
-        # ── 액션 처리 ────────────────────────────────────────────────────────
-        target_pos = float(
-            np.clip(action[0], -self.max_position, self.max_position)
-        )
+        # ── 이산 액션 → 목표 포지션 변환 ────────────────────────────────────
+        action_int = int(action)
+        target_pos = _ACTION_TO_POSITION[action_int]
         delta = target_pos - self._position
 
         idx = self._current_idx()
@@ -228,9 +241,13 @@ class CryptoTradingEnv(gym.Env):
         # ── 수수료: |Δpos| × fee_rate (bps 단위) ────────────────────────────
         fee_bps = abs(delta) * self.fee_rate * REWARD_SCALE
 
-        # ── 진입 가격 업데이트 (VWAP 방식 가중 평균) ─────────────────────────
+        # ── 고정 행동 변경 패널티 (포지션이 실제로 바뀔 때만) ────────────────
         prev_pos = self._position
-        if abs(delta) > 1e-6:
+        position_changed = abs(delta) > 1e-6
+        fixed_penalty_bps = self.action_change_penalty if position_changed else 0.0
+
+        # ── 진입 가격 업데이트 ────────────────────────────────────────────────
+        if position_changed:
             if abs(target_pos) < 1e-6:
                 # 완전 청산 → 진입가 초기화
                 self._entry_price = None
@@ -247,11 +264,10 @@ class CryptoTradingEnv(gym.Env):
         log_ret = np.log(price_t1 / price_t)
         pnl_bps = float(self._position * log_ret * REWARD_SCALE)
 
-        # ── 휩소 패널티 (Δpos² 이차 패널티) ─────────────────────────────────
-        # 소폭 조정은 관용, 급격한 방향 전환은 강하게 패널티
+        # ── 선택적 이차 휩소 패널티 (기본 0.0) ───────────────────────────────
         whipsaw_penalty = float(self.whipsaw_coeff * delta ** 2 * REWARD_SCALE)
 
-        reward = pnl_bps - fee_bps - whipsaw_penalty
+        reward = pnl_bps - fee_bps - fixed_penalty_bps - whipsaw_penalty
 
         # ── 거래 기록 ─────────────────────────────────────────────────────────
         self._trades.append(
@@ -261,10 +277,12 @@ class CryptoTradingEnv(gym.Env):
                 "price": price_t,
                 "prev_position": prev_pos,
                 "position": self._position,
+                "action": action_int,
                 "delta": delta,
                 "log_ret": float(log_ret),
                 "pnl_bps": pnl_bps,
                 "fee_bps": fee_bps,
+                "fixed_penalty_bps": fixed_penalty_bps,
                 "whipsaw_penalty": whipsaw_penalty,
                 "reward": reward,
                 "xgb_prob": float(self._xgb_arr[idx]),
@@ -284,6 +302,7 @@ class CryptoTradingEnv(gym.Env):
         info = {
             "pnl_bps": pnl_bps,
             "fee_bps": fee_bps,
+            "fixed_penalty_bps": fixed_penalty_bps,
             "position": self._position,
         }
         return obs, float(reward), terminated, False, info
